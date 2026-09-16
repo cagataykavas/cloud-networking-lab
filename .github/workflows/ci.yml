@@ -15,6 +15,6 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements.txt
       - run: ruff check app tools tests 01_cidr.py 02_tcp_echo.py
-      - run: pytest -q
+      - run: python -m pytest -q
       - run: docker compose config
       - run: docker build -t cloud-networking-lab:test .
