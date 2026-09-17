@@ -41,6 +41,30 @@ docker compose start backend_a
 
 This makes proxy retry/failover behavior visible. The Nginx config uses connection/read timeouts, upstream fail counters and bounded `proxy_next_upstream` retries rather than infinite retry behavior.
 
+## Secure outbound destination policy
+
+`tools/egress_policy.py` provides a deterministic pre-connection policy for services and tool-using agents that make outbound HTTP requests. It evaluates the URL and the complete resolved DNS answer set together:
+
+```python
+from tools.egress_policy import EgressPolicy, evaluate_destination
+
+policy = EgressPolicy(
+    allowed_hosts=("api.example.com", "*.trusted.example"),
+    allowed_schemes=("https",),
+    allowed_ports=(443,),
+)
+decision = evaluate_destination(
+    "https://api.example.com/v1/models",
+    ["8.8.8.8", "2001:4860:4860::8888"],
+    policy,
+)
+assert decision.allowed
+```
+
+The default posture blocks loopback, private, link-local, reserved and metadata endpoints. Every DNS answer must pass, preventing a hostname with mixed public/private answers from bypassing the policy. Explicit private CIDRs can be allowed for internal services, but cloud instance metadata addresses remain hard-blocked.
+
+This is a validation boundary, not an HTTP client. Production callers must connect to one of the validated addresses, preserve the original hostname for TLS verification, and repeat evaluation after DNS refreshes and redirects.
+
 ## Hands-on labs
 
 | Lab | Demonstrates |
@@ -50,6 +74,7 @@ This makes proxy retry/failover behavior visible. The Nginx config uses connecti
 | `app/backend.py` | HTTP application behind a proxy; forwarded headers and instance identity |
 | `nginx.conf` | Layer-7 reverse proxy, least-connection balancing, keep-alive and timeout policy |
 | `tools/network_probe.py` | DNS resolution → TCP connect → HTTP request timing |
+| `tools/egress_policy.py` | SSRF-resistant URL, DNS-answer and cloud-metadata egress policy |
 | `tools/load_demo.py` | concurrency, throughput, latency percentiles and backend distribution |
 | `docker-compose.yml` | edge/private network segmentation and service discovery by DNS name |
 
@@ -79,4 +104,4 @@ curl -v http://localhost:8080/whoami
 
 ## Quality gates
 
-GitHub Actions runs Ruff, pytest, Docker Compose validation and a container build. The project is intentionally small enough to reason about packet flow at a whiteboard but complete enough to reproduce the topology locally.
+GitHub Actions runs Ruff, pytest (including egress-policy security cases), Docker Compose validation and a container build. The project is intentionally small enough to reason about packet flow at a whiteboard but complete enough to reproduce the topology locally.
