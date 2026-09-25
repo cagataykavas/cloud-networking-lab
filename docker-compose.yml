@@ -18,6 +18,7 @@ services:
     build: .
     environment:
       INSTANCE_ID: backend-a
+      TRUSTED_PROXY_CIDRS: 172.29.0.0/24
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=1)"]
       interval: 3s
@@ -31,6 +32,7 @@ services:
     build: .
     environment:
       INSTANCE_ID: backend-b
+      TRUSTED_PROXY_CIDRS: 172.29.0.0/24
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=1)"]
       interval: 3s
