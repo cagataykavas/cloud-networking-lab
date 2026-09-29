@@ -1,0 +1,40 @@
+name: runtime-reachability
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-reachability-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  edge-isolation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned test dependencies
+        run: pip install -r requirements.txt
+      - name: Verify reachability policy unit contracts
+        run: python -m pytest -q tests/test_runtime_reachability.py
+      - name: Audit live Compose reachability
+        run: |
+          python tools/runtime_reachability.py \
+            --project-name "reachability-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --output artifacts/runtime-reachability.json
+      - name: Upload reachability evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-reachability-evidence
+          path: artifacts/runtime-reachability.json
+          if-no-files-found: error
+          retention-days: 14
