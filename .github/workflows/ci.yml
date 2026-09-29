@@ -17,4 +17,10 @@ jobs:
       - run: ruff check app tools tests 01_cidr.py 02_tcp_echo.py
       - run: python -m pytest -q
       - run: docker compose config
+      - name: Audit edge/private network segmentation
+        run: |
+          docker compose config --format json > /tmp/compose.json
+          python tools/topology_audit.py /tmp/compose.json \
+            --backend-service backend_a \
+            --backend-service backend_b
       - run: docker build -t cloud-networking-lab:test .
