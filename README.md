@@ -28,6 +28,27 @@ python tools/network_probe.py http://localhost:8080/whoami
 
 Repeated `/whoami` calls expose the selected backend so load balancing is observable. `load_demo.py` reports backend distribution, throughput and p50/p95/p99 latency.
 
+### Bounded load generation
+
+The load demo keeps at most `concurrency` submitted/unconsumed requests in its
+execution window instead of queuing one Future per requested operation. It
+aggregates backend counts and failure totals incrementally and retains only five
+failure **types**, never exception messages that may contain URLs or response data.
+Response bodies are limited to 64 KiB and must contain a non-blank string
+`instance_id` of at most 128 characters; malformed responses count as failures.
+
+Budgets are validated before traffic starts: 1–100,000 requests, 1–128 workers,
+and a finite per-socket timeout in `(0, 60]` seconds. More workers than requests
+does not create unnecessary worker slots. Exact latency percentiles still retain
+one float per successful request, so the report is bounded by the request budget
+rather than constant-memory. Latency statistics describe successful responses only.
+
+This remains a closed-loop diagnostic, not a rate-controlled benchmark: backpressure
+can hide saturation (coordinated omission), DNS and trickle responses are not covered
+by an end-to-end deadline, and redirects/proxy environment configuration follow
+`urllib` behavior. It is not an SSRF-safe fetcher. Use it only against authorized
+targets; a next step is an explicit request-rate schedule with deadline accounting.
+
 ## Failure experiments
 
 While the stack is running:
