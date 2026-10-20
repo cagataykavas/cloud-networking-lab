@@ -2,24 +2,136 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import ipaddress
 import json
 import math
 import statistics
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter
+from dataclasses import dataclass
+from typing import BinaryIO
 
 MAX_REQUESTS = 100_000
 MAX_CONCURRENCY = 128
 MAX_RESPONSE_BYTES = 64 * 1024
+MAX_ALLOWED_NETWORKS = 32
+MAX_TARGET_URL_BYTES = 2048
+DEFAULT_ALLOWED_CIDRS = ("127.0.0.0/8", "::1/128")
 
 
-def request_once(url: str, timeout: float) -> tuple[str, float, int]:
+@dataclass(frozen=True)
+class TargetPolicy:
+    allowed_networks: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]
+
+    @classmethod
+    def from_cidrs(cls, cidrs: tuple[str, ...] = ()) -> TargetPolicy:
+        configured = cidrs or DEFAULT_ALLOWED_CIDRS
+        if len(configured) > MAX_ALLOWED_NETWORKS:
+            raise ValueError(
+                f"at most {MAX_ALLOWED_NETWORKS} allowed networks are supported"
+            )
+        networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+        for value in configured:
+            try:
+                network = ipaddress.ip_network(value, strict=True)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"invalid canonical allowlist CIDR: {value!r}"
+                ) from error
+            boundary_addresses = (network.network_address, network.broadcast_address)
+            if any(
+                address.is_multicast or address.is_unspecified or address.is_link_local
+                for address in boundary_addresses
+            ):
+                raise ValueError(
+                    "multicast, unspecified and link-local networks cannot be allowed"
+                )
+            networks.append(network)
+        return cls(tuple(networks))
+
+    def validate_url(self, url: str) -> None:
+        if not isinstance(url, str) or not url:
+            raise ValueError("target URL must be a non-empty string")
+        if len(url.encode("utf-8")) > MAX_TARGET_URL_BYTES:
+            raise ValueError(
+                f"target URL exceeds the {MAX_TARGET_URL_BYTES}-byte limit"
+            )
+        if any(ord(character) <= 0x20 or ord(character) == 0x7F for character in url):
+            raise ValueError(
+                "target URL cannot contain whitespace or control characters"
+            )
+        try:
+            parsed = urllib.parse.urlsplit(url)
+            port = parsed.port
+        except ValueError as error:
+            raise ValueError(
+                "target URL contains an invalid port or address"
+            ) from error
+        if parsed.scheme not in {"http", "https"}:
+            raise ValueError("target URL scheme must be http or https")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("target URL cannot contain credentials")
+        if parsed.fragment:
+            raise ValueError("target URL cannot contain a fragment")
+        if parsed.hostname is None:
+            raise ValueError("target URL requires an IP-literal host")
+        if port is not None and not 1 <= port <= 65535:
+            raise ValueError("target URL port is outside 1..65535")
+        try:
+            address = ipaddress.ip_address(parsed.hostname)
+        except ValueError as error:
+            raise ValueError(
+                "target URL host must be an IP literal to prevent DNS rebinding"
+            ) from error
+        if address.is_multicast or address.is_unspecified or address.is_link_local:
+            raise ValueError("target address class is not permitted")
+        if not any(address in network for network in self.allowed_networks):
+            raise ValueError(
+                "target address is outside the configured network allowlist"
+            )
+
+
+class PolicyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, policy: TargetPolicy) -> None:
+        self.policy = policy
+
+    def redirect_request(
+        self, req, fp: BinaryIO, code: int, msg: str, headers, newurl: str
+    ):
+        self.policy.validate_url(newurl)
+        old_scheme = urllib.parse.urlsplit(req.full_url).scheme
+        new_scheme = urllib.parse.urlsplit(newurl).scheme
+        if old_scheme == "https" and new_scheme != "https":
+            raise urllib.error.HTTPError(
+                newurl, code, "HTTPS downgrade redirect rejected", headers, fp
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def build_opener(policy: TargetPolicy) -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        PolicyRedirectHandler(policy),
+    )
+
+
+def request_once(
+    url: str,
+    timeout: float,
+    opener: urllib.request.OpenerDirector | None = None,
+    policy: TargetPolicy | None = None,
+) -> tuple[str, float, int]:
+    policy = policy or TargetPolicy.from_cidrs()
+    policy.validate_url(url)
+    opener = opener or build_opener(policy)
     started = time.perf_counter()
     request = urllib.request.Request(
         url, headers={"User-Agent": "cloud-networking-lab/1.0"}
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with opener.open(request, timeout=timeout) as response:
         body = response.read(MAX_RESPONSE_BYTES + 1)
         if len(body) > MAX_RESPONSE_BYTES:
             raise ValueError("response exceeds the load probe byte limit")
@@ -46,7 +158,13 @@ def percentile(values: list[float], quantile: float) -> float:
     return ordered[index]
 
 
-def run(url: str, requests: int, concurrency: int, timeout: float) -> dict[str, object]:
+def run(
+    url: str,
+    requests: int,
+    concurrency: int,
+    timeout: float,
+    allowed_cidrs: tuple[str, ...] = (),
+) -> dict[str, object]:
     if (
         isinstance(requests, bool)
         or not isinstance(requests, int)
@@ -70,6 +188,9 @@ def run(url: str, requests: int, concurrency: int, timeout: float) -> dict[str, 
         raise ValueError(
             "timeout must be finite and between 0 (exclusive) and 60 seconds"
         )
+    policy = TargetPolicy.from_cidrs(allowed_cidrs)
+    policy.validate_url(url)
+    opener = build_opener(policy)
 
     latencies: list[float] = []
     backends: Counter[str] = Counter()
@@ -78,7 +199,10 @@ def run(url: str, requests: int, concurrency: int, timeout: float) -> dict[str, 
     started = time.perf_counter()
     workers = min(concurrency, requests)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        pending = {pool.submit(request_once, url, timeout) for _ in range(workers)}
+        pending = {
+            pool.submit(request_once, url, timeout, opener, policy)
+            for _ in range(workers)
+        }
         submitted = workers
         while pending:
             completed, pending = concurrent.futures.wait(
@@ -98,7 +222,7 @@ def run(url: str, requests: int, concurrency: int, timeout: float) -> dict[str, 
             completed.clear()
             del future
             while submitted < requests and len(pending) < workers:
-                pending.add(pool.submit(request_once, url, timeout))
+                pending.add(pool.submit(request_once, url, timeout, opener, policy))
                 submitted += 1
     elapsed = time.perf_counter() - started
     return {
@@ -122,14 +246,27 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate concurrent traffic through the reverse proxy."
     )
-    parser.add_argument("--url", default="http://localhost:8080/whoami")
+    parser.add_argument("--url", default="http://127.0.0.1:8080/whoami")
     parser.add_argument("--requests", type=int, default=100)
     parser.add_argument("--concurrency", type=int, default=16)
     parser.add_argument("--timeout", type=float, default=3.0)
+    parser.add_argument(
+        "--allow-cidr",
+        action="append",
+        default=[],
+        help="canonical target network; repeat to replace the loopback-only default",
+    )
     args = parser.parse_args()
     print(
         json.dumps(
-            run(args.url, args.requests, args.concurrency, args.timeout), indent=2
+            run(
+                args.url,
+                args.requests,
+                args.concurrency,
+                args.timeout,
+                tuple(args.allow_cidr),
+            ),
+            indent=2,
         )
     )
 

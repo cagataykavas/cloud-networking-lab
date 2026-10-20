@@ -22,7 +22,7 @@ The backend containers are intentionally attached only to the internal `private_
 ```bash
 docker compose up --build
 curl http://localhost:8080/whoami
-python tools/load_demo.py --requests 200 --concurrency 32
+python tools/load_demo.py --url http://127.0.0.1:8080/whoami --requests 200 --concurrency 32
 python tools/network_probe.py http://localhost:8080/whoami
 ```
 
@@ -37,6 +37,21 @@ failure **types**, never exception messages that may contain URLs or response da
 Response bodies are limited to 64 KiB and must contain a non-blank string
 `instance_id` of at most 128 characters; malformed responses count as failures.
 
+The traffic target is fail-closed. Hosts must be IP literals, which removes DNS
+rebinding between admission and connection. Loopback IPv4/IPv6 are the only
+default destinations; repeat `--allow-cidr` with canonical networks to authorize
+a private lab subnet explicitly. Userinfo, fragments, unsafe address classes and
+out-of-scope redirect hops are rejected. HTTPS-to-HTTP redirects are denied and
+ambient HTTP(S) proxy variables are ignored, so the measured peer cannot be
+silently replaced by workstation or CI configuration. For example:
+
+```bash
+python tools/load_demo.py \
+  --url http://10.42.0.10:8080/whoami \
+  --allow-cidr 10.42.0.0/16 \
+  --requests 200 --concurrency 32
+```
+
 Budgets are validated before traffic starts: 1–100,000 requests, 1–128 workers,
 and a finite per-socket timeout in `(0, 60]` seconds. More workers than requests
 does not create unnecessary worker slots. Exact latency percentiles still retain
@@ -44,10 +59,10 @@ one float per successful request, so the report is bounded by the request budget
 rather than constant-memory. Latency statistics describe successful responses only.
 
 This remains a closed-loop diagnostic, not a rate-controlled benchmark: backpressure
-can hide saturation (coordinated omission), DNS and trickle responses are not covered
-by an end-to-end deadline, and redirects/proxy environment configuration follow
-`urllib` behavior. It is not an SSRF-safe fetcher. Use it only against authorized
-targets; a next step is an explicit request-rate schedule with deadline accounting.
+can hide saturation (coordinated omission), and trickle responses are not covered by
+an end-to-end deadline. An allowlisted address proves network scope, not operator
+authorization or service identity; use it only against approved targets. A next step
+is an explicit request-rate schedule with deadline accounting.
 
 ## Failure experiments
 
