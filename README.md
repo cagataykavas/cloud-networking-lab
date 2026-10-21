@@ -49,7 +49,8 @@ silently replaced by workstation or CI configuration. For example:
 python tools/load_demo.py \
   --url http://10.42.0.10:8080/whoami \
   --allow-cidr 10.42.0.0/16 \
-  --requests 200 --concurrency 32
+  --requests 200 --concurrency 32 \
+  --rate 50 --deadline 2 --run-id capacity-check-01
 ```
 
 Budgets are validated before traffic starts: 1–100,000 requests, 1–128 workers,
@@ -58,11 +59,25 @@ does not create unnecessary worker slots. Exact latency percentiles still retain
 one float per successful request, so the report is bounded by the request budget
 rather than constant-memory. Latency statistics describe successful responses only.
 
-This remains a closed-loop diagnostic, not a rate-controlled benchmark: backpressure
-can hide saturation (coordinated omission), and trickle responses are not covered by
-an end-to-end deadline. An allowlisted address proves network scope, not operator
-authorization or service identity; use it only against approved targets. A next step
-is an explicit request-rate schedule with deadline accounting.
+Without `--rate`, the tool remains a closed-loop diagnostic. With `--rate`, arrivals
+follow a monotonic constant-rate schedule independent of completion time. If all
+worker slots are occupied at an arrival, the request is recorded as
+`ClientSaturated` instead of being silently delayed; this makes client-side
+backpressure and coordinated omission visible. Arrival schedules are capped at ten
+minutes and 10,000 requests/second.
+
+Every admitted request carries `X-Loadgen-Request-ID` as
+`<run-id>-<sequence>`, allowing proxy/backend logs to join client evidence without
+putting URLs or exception text in the report. `--deadline` includes schedule delay,
+queue time, connect/read work and response parsing. The remaining deadline caps the
+socket timeout, and late completions are counted separately. Python's blocking
+socket operations cannot be forcibly preempted between reads, so the final monotonic
+check is authoritative for deadline classification rather than a hard real-time
+cancellation guarantee.
+
+An allowlisted address proves network scope, not operator authorization or service
+identity; use the tool only against approved targets. Client saturation still needs
+correlation with proxy/backend telemetry before it can be attributed to the service.
 
 ## Failure experiments
 

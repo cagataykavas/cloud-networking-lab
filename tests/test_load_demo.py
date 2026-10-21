@@ -55,6 +55,66 @@ def test_response_exactly_at_byte_limit_is_accepted():
     assert response.closed
 
 
+def test_request_id_is_propagated_and_deadline_caps_socket_timeout(monkeypatch):
+    response = Response(b'{"instance_id":"a"}')
+    opener = StaticOpener(response)
+    monkeypatch.setattr(load_demo.time, "perf_counter", lambda: 11.0)
+
+    backend, latency, status = load_demo.request_once(
+        "http://127.0.0.1",
+        3.0,
+        opener,
+        request_id="run-a-000001",
+        scheduled_at=10.0,
+        deadline_at=12.0,
+    )
+
+    assert (backend, latency, status) == ("a", 1000.0, 200)
+    assert opener.timeout == 1.0
+    assert opener.request.headers["X-loadgen-request-id"] == "run-a-000001"
+
+
+def test_response_after_end_to_end_deadline_is_rejected(monkeypatch):
+    response = Response(b'{"instance_id":"a"}')
+    moments = iter((10.0, 12.1))
+    monkeypatch.setattr(load_demo.time, "perf_counter", lambda: next(moments))
+
+    with pytest.raises(load_demo.DeadlineExceeded, match="completed after"):
+        load_demo.request_once(
+            "http://127.0.0.1",
+            3.0,
+            StaticOpener(response),
+            scheduled_at=10.0,
+            deadline_at=12.0,
+        )
+
+
+def test_request_id_header_injection_fails_before_io():
+    with pytest.raises(ValueError, match="request_id"):
+        load_demo.request_once(
+            "http://127.0.0.1",
+            1,
+            StaticOpener(Response(b"{}")),
+            request_id="run-a\r\nInjected: yes",
+        )
+
+
+def test_socket_timeout_under_deadline_is_classified(monkeypatch):
+    class TimeoutOpener:
+        def open(self, *_args, **_kwargs):
+            raise TimeoutError("private peer timing")
+
+    monkeypatch.setattr(load_demo.time, "perf_counter", lambda: 10.0)
+    with pytest.raises(load_demo.DeadlineExceeded, match="end-to-end"):
+        load_demo.request_once(
+            "http://127.0.0.1",
+            3,
+            TimeoutOpener(),
+            scheduled_at=10.0,
+            deadline_at=12.0,
+        )
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -144,6 +204,13 @@ def test_bounded_submission_window_and_exact_aggregate_metrics(monkeypatch):
         {"timeout": float("inf")},
         {"timeout": 61},
         {"timeout": True},
+        {"rate_per_second": 0},
+        {"rate_per_second": float("inf")},
+        {"rate_per_second": 10_001},
+        {"requests": 2, "rate_per_second": 0.001},
+        {"deadline": 0},
+        {"deadline": float("nan")},
+        {"run_id": "contains whitespace"},
     ],
 )
 def test_invalid_budgets_fail_before_any_request(monkeypatch, changes):
@@ -169,6 +236,98 @@ def test_all_failed_requests_keep_exact_count_and_five_error_types(monkeypatch):
     assert result["sample_failures"] == ["RuntimeError"] * 5
     assert all(value == 0 for value in result["latency_ms"].values())
     assert "secret-bearing" not in json.dumps(result)
+
+
+def test_deadline_failures_have_low_cardinality_accounting(monkeypatch):
+    def expired(*_args):
+        raise load_demo.DeadlineExceeded("private timing context")
+
+    monkeypatch.setattr(load_demo, "request_once", expired)
+    result = load_demo.run(
+        "http://127.0.0.1", 3, 1, 1, deadline=0.5, run_id="deadline-test"
+    )
+
+    assert result["failed"] == 3
+    assert result["load_model"]["deadline_exceeded"] == 3
+    assert result["sample_failures"] == ["DeadlineExceeded"] * 3
+    assert "private timing" not in json.dumps(result)
+
+
+def test_constant_rate_schedule_reports_client_saturation(monkeypatch):
+    class Clock:
+        now = 0.0
+
+        @classmethod
+        def sleep(cls, seconds):
+            cls.now += seconds
+
+    class Future:
+        def __init__(self, due_at):
+            self.due_at = due_at
+
+        def done(self):
+            return Clock.now >= self.due_at
+
+        def result(self):
+            assert self.done()
+            return "backend-a", 250.0, 200
+
+    class Executor:
+        request_ids = []
+
+        def __init__(self, max_workers):
+            assert max_workers == 2
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def submit(self, _function, *_args):
+            self.request_ids.append(_args[4])
+            return Future(Clock.now + 0.25)
+
+    def wait(pending, return_when):
+        assert return_when == concurrent.futures.FIRST_COMPLETED
+        Clock.now = min(future.due_at for future in pending)
+        completed = {future for future in pending if future.done()}
+        return completed, pending - completed
+
+    monkeypatch.setattr(load_demo.time, "perf_counter", lambda: Clock.now)
+    monkeypatch.setattr(load_demo.time, "sleep", Clock.sleep)
+    monkeypatch.setattr(load_demo.concurrent.futures, "ThreadPoolExecutor", Executor)
+    monkeypatch.setattr(load_demo.concurrent.futures, "wait", wait)
+
+    result = load_demo.run(
+        "http://127.0.0.1",
+        requests=6,
+        concurrency=2,
+        timeout=1,
+        rate_per_second=10,
+        deadline=1,
+        run_id="run-test",
+    )
+
+    assert result["requested"] == 6
+    assert result["succeeded"] == 4
+    assert result["failed"] == 2
+    assert result["load_model"] == {
+        "mode": "constant_rate",
+        "run_id": "run-test",
+        "target_rate_per_second": 10,
+        "deadline_seconds": 1,
+        "client_saturated": 2,
+        "deadline_exceeded": 0,
+        "schedule_lag_ms": {"p50": 0.0, "p95": 0.0, "max": 0.0},
+    }
+    assert result["sample_failures"] == ["ClientSaturated", "ClientSaturated"]
+    assert Executor.request_ids == [
+        "run-test-000000",
+        "run-test-000001",
+        "run-test-000003",
+        "run-test-000004",
+    ]
 
 
 def test_small_request_budget_works_with_larger_concurrency(monkeypatch):
