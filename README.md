@@ -22,11 +22,62 @@ The backend containers are intentionally attached only to the internal `private_
 ```bash
 docker compose up --build
 curl http://localhost:8080/whoami
-python tools/load_demo.py --requests 200 --concurrency 32
+python tools/load_demo.py --url http://127.0.0.1:8080/whoami --requests 200 --concurrency 32
 python tools/network_probe.py http://localhost:8080/whoami
 ```
 
 Repeated `/whoami` calls expose the selected backend so load balancing is observable. `load_demo.py` reports backend distribution, throughput and p50/p95/p99 latency.
+
+### Bounded load generation
+
+The load demo keeps at most `concurrency` submitted/unconsumed requests in its
+execution window instead of queuing one Future per requested operation. It
+aggregates backend counts and failure totals incrementally and retains only five
+failure **types**, never exception messages that may contain URLs or response data.
+Response bodies are limited to 64 KiB and must contain a non-blank string
+`instance_id` of at most 128 characters; malformed responses count as failures.
+
+The traffic target is fail-closed. Hosts must be IP literals, which removes DNS
+rebinding between admission and connection. Loopback IPv4/IPv6 are the only
+default destinations; repeat `--allow-cidr` with canonical networks to authorize
+a private lab subnet explicitly. Userinfo, fragments, unsafe address classes and
+out-of-scope redirect hops are rejected. HTTPS-to-HTTP redirects are denied and
+ambient HTTP(S) proxy variables are ignored, so the measured peer cannot be
+silently replaced by workstation or CI configuration. For example:
+
+```bash
+python tools/load_demo.py \
+  --url http://10.42.0.10:8080/whoami \
+  --allow-cidr 10.42.0.0/16 \
+  --requests 200 --concurrency 32 \
+  --rate 50 --deadline 2 --run-id capacity-check-01
+```
+
+Budgets are validated before traffic starts: 1–100,000 requests, 1–128 workers,
+and a finite per-socket timeout in `(0, 60]` seconds. More workers than requests
+does not create unnecessary worker slots. Exact latency percentiles still retain
+one float per successful request, so the report is bounded by the request budget
+rather than constant-memory. Latency statistics describe successful responses only.
+
+Without `--rate`, the tool remains a closed-loop diagnostic. With `--rate`, arrivals
+follow a monotonic constant-rate schedule independent of completion time. If all
+worker slots are occupied at an arrival, the request is recorded as
+`ClientSaturated` instead of being silently delayed; this makes client-side
+backpressure and coordinated omission visible. Arrival schedules are capped at ten
+minutes and 10,000 requests/second.
+
+Every admitted request carries `X-Loadgen-Request-ID` as
+`<run-id>-<sequence>`, allowing proxy/backend logs to join client evidence without
+putting URLs or exception text in the report. `--deadline` includes schedule delay,
+queue time, connect/read work and response parsing. The remaining deadline caps the
+socket timeout, and late completions are counted separately. Python's blocking
+socket operations cannot be forcibly preempted between reads, so the final monotonic
+check is authoritative for deadline classification rather than a hard real-time
+cancellation guarantee.
+
+An allowlisted address proves network scope, not operator authorization or service
+identity; use the tool only against approved targets. Client saturation still needs
+correlation with proxy/backend telemetry before it can be attributed to the service.
 
 ## Failure experiments
 
