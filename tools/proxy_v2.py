@@ -4,10 +4,12 @@ import argparse
 import hashlib
 import ipaddress
 import json
+import math
 import struct
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import BinaryIO, Sequence
+from typing import BinaryIO, Callable, Protocol, Sequence
 
 
 SIGNATURE = b"\r\n\r\n\x00\r\nQUIT\n"
@@ -30,6 +32,7 @@ EXIT_ACCEPTED = 0
 EXIT_REJECTED = 2
 EXIT_MALFORMED = 3
 MAX_POLICY_BYTES = 65536
+MAX_HEADER_READ_SECONDS = 30.0
 
 Network = ipaddress.IPv4Network | ipaddress.IPv6Network
 Address = ipaddress.IPv4Address | ipaddress.IPv6Address
@@ -45,6 +48,20 @@ class MalformedHeader(ProxyV2Error):
 
 class PolicyRejected(ProxyV2Error):
     """A well-formed header violates the configured trust boundary."""
+
+
+class HeaderReadDeadlineExceeded(TimeoutError):
+    """The complete PROXY preamble did not arrive before its monotonic deadline."""
+
+
+class SocketReader(Protocol):
+    """Small socket surface required by the deadline-aware reader."""
+
+    def gettimeout(self) -> float | None: ...
+
+    def settimeout(self, value: float | None) -> None: ...
+
+    def recv(self, bufsize: int) -> bytes: ...
 
 
 @dataclass(frozen=True)
@@ -104,7 +121,8 @@ class ProxyV2Policy:
     ) -> ProxyV2Policy:
         return cls(
             trusted_proxy_cidrs=tuple(
-                ipaddress.ip_network(value, strict=True) for value in trusted_proxy_cidrs
+                ipaddress.ip_network(value, strict=True)
+                for value in trusted_proxy_cidrs
             ),
             destination_cidrs=tuple(
                 ipaddress.ip_network(value, strict=True) for value in destination_cidrs
@@ -173,9 +191,9 @@ class _ParsedHeader:
 
 
 def _sha256_json(document: object) -> str:
-    encoded = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode(
-        "ascii"
-    )
+    encoded = json.dumps(
+        document, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -200,7 +218,10 @@ def _canonical_address(value: str, *, field: str) -> Address:
 
 
 def _contains(address: Address, networks: tuple[Network, ...]) -> bool:
-    return any(address.version == network.version and address in network for network in networks)
+    return any(
+        address.version == network.version and address in network
+        for network in networks
+    )
 
 
 def _parse_tlvs(
@@ -230,7 +251,9 @@ def _parse_tlvs(
             if tlv_length != 4:
                 raise MalformedHeader("invalid_crc32c_length")
             crc_value_offset = value_offset
-        elif tlv_type == TLV_UNIQUE_ID and not (1 <= tlv_length <= policy.max_unique_id_bytes):
+        elif tlv_type == TLV_UNIQUE_ID and not (
+            1 <= tlv_length <= policy.max_unique_id_bytes
+        ):
             raise PolicyRejected("unique_id_size_invalid")
         tlv_types.append(tlv_type)
         offset = end
@@ -357,12 +380,16 @@ def admit_proxy_v2(
             raise PolicyRejected("destination_port_denied")
     except MalformedHeader as exc:
         return AdmissionResult(
-            evidence=_evidence(outcome="malformed", reason=str(exc), header=header, policy=policy),
+            evidence=_evidence(
+                outcome="malformed", reason=str(exc), header=header, policy=policy
+            ),
             metadata=None,
         )
     except PolicyRejected as exc:
         return AdmissionResult(
-            evidence=_evidence(outcome="rejected", reason=str(exc), header=header, policy=policy),
+            evidence=_evidence(
+                outcome="rejected", reason=str(exc), header=header, policy=policy
+            ),
             metadata=None,
         )
 
@@ -404,6 +431,75 @@ def read_proxy_v2_header(stream: BinaryIO, *, max_header_bytes: int) -> bytes:
     if len(payload) != declared_payload:
         raise MalformedHeader("truncated_declared_payload")
     return fixed + payload
+
+
+def _recv_exact_before(
+    connection: SocketReader,
+    count: int,
+    *,
+    deadline: float,
+    clock: Callable[[], float],
+) -> bytes:
+    chunks: list[bytes] = []
+    remaining_bytes = count
+    while remaining_bytes:
+        remaining_seconds = deadline - clock()
+        if remaining_seconds <= 0:
+            raise HeaderReadDeadlineExceeded("proxy_header_deadline_exceeded")
+        connection.settimeout(remaining_seconds)
+        try:
+            chunk = connection.recv(remaining_bytes)
+        except TimeoutError as exc:
+            raise HeaderReadDeadlineExceeded("proxy_header_deadline_exceeded") from exc
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining_bytes -= len(chunk)
+    return b"".join(chunks)
+
+
+def read_proxy_v2_socket(
+    connection: SocketReader,
+    *,
+    max_header_bytes: int,
+    read_timeout_seconds: float,
+    clock: Callable[[], float] = time.monotonic,
+) -> bytes:
+    """Read one preamble under a single deadline and restore the socket timeout."""
+    if (
+        isinstance(read_timeout_seconds, bool)
+        or not isinstance(read_timeout_seconds, (int, float))
+        or not math.isfinite(read_timeout_seconds)
+        or not 0 < read_timeout_seconds <= MAX_HEADER_READ_SECONDS
+    ):
+        raise ValueError("read timeout must be finite and in (0, 30] seconds")
+
+    original_timeout = connection.gettimeout()
+    deadline = clock() + read_timeout_seconds
+    try:
+        fixed = _recv_exact_before(
+            connection,
+            FIXED_HEADER_BYTES,
+            deadline=deadline,
+            clock=clock,
+        )
+        if len(fixed) != FIXED_HEADER_BYTES:
+            raise MalformedHeader("truncated_fixed_header")
+        declared_payload = struct.unpack_from("!H", fixed, 14)[0]
+        total = FIXED_HEADER_BYTES + declared_payload
+        if total > max_header_bytes:
+            raise PolicyRejected("header_size_exceeded")
+        payload = _recv_exact_before(
+            connection,
+            declared_payload,
+            deadline=deadline,
+            clock=clock,
+        )
+        if len(payload) != declared_payload:
+            raise MalformedHeader("truncated_declared_payload")
+        return fixed + payload
+    finally:
+        connection.settimeout(original_timeout)
 
 
 def _reject_json_constant(value: str) -> None:
@@ -455,15 +551,23 @@ def _load_policy(path: Path) -> ProxyV2Policy:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Fail-closed PROXY protocol v2 admission audit.")
-    parser.add_argument("header", type=Path, help="binary file containing exactly one header")
-    parser.add_argument("--peer", required=True, help="canonical immediate socket peer IP")
+    parser = argparse.ArgumentParser(
+        description="Fail-closed PROXY protocol v2 admission audit."
+    )
+    parser.add_argument(
+        "header", type=Path, help="binary file containing exactly one header"
+    )
+    parser.add_argument(
+        "--peer", required=True, help="canonical immediate socket peer IP"
+    )
     parser.add_argument("--policy", required=True, type=Path, help="JSON policy file")
     args = parser.parse_args(argv)
     try:
         policy = _load_policy(args.policy)
         with args.header.open("rb") as stream:
-            header = read_proxy_v2_header(stream, max_header_bytes=policy.max_header_bytes)
+            header = read_proxy_v2_header(
+                stream, max_header_bytes=policy.max_header_bytes
+            )
             if stream.read(1):
                 raise MalformedHeader("trailing_bytes_after_header")
         result = admit_proxy_v2(header, immediate_peer=args.peer, policy=policy)

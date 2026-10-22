@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import ipaddress
 import json
+import math
+import socket
 import struct
 
 import pytest
@@ -15,6 +17,7 @@ from tools.proxy_v2 import (
     TLV_CRC32C,
     TLV_NOOP,
     TLV_UNIQUE_ID,
+    HeaderReadDeadlineExceeded,
     MalformedHeader,
     PolicyRejected,
     ProxyV2Policy,
@@ -22,12 +25,41 @@ from tools.proxy_v2 import (
     crc32c,
     main,
     read_proxy_v2_header,
+    read_proxy_v2_socket,
 )
 
 
 class ChunkedReader(io.BytesIO):
     def read(self, size: int = -1) -> bytes:
         return super().read(min(size, 3) if size >= 0 else size)
+
+
+class ScriptedSocket:
+    def __init__(self, chunks: list[bytes], clock_state: list[float]) -> None:
+        self.chunks = chunks
+        self.clock_state = clock_state
+        self.timeout: float | None = 7.0
+        self.timeout_history: list[float | None] = []
+
+    def gettimeout(self) -> float | None:
+        return self.timeout
+
+    def settimeout(self, value: float | None) -> None:
+        self.timeout = value
+        self.timeout_history.append(value)
+
+    def recv(self, bufsize: int) -> bytes:
+        self.clock_state[0] += 0.1
+        if not self.chunks:
+            return b""
+        chunk = self.chunks.pop(0)
+        assert len(chunk) <= bufsize
+        return chunk
+
+
+class TimingOutSocket(ScriptedSocket):
+    def recv(self, bufsize: int) -> bytes:
+        raise TimeoutError
 
 
 def policy(**overrides: object) -> ProxyV2Policy:
@@ -54,16 +86,22 @@ def build_header(
     source_ip = ipaddress.ip_address(source)
     destination_ip = ipaddress.ip_address(destination)
     if family_protocol is None:
-        family_protocol = FAM_INET_STREAM if source_ip.version == 4 else FAM_INET6_STREAM
+        family_protocol = (
+            FAM_INET_STREAM if source_ip.version == 4 else FAM_INET6_STREAM
+        )
     address_block = (
-        source_ip.packed + destination_ip.packed + struct.pack("!HH", source_port, destination_port)
+        source_ip.packed
+        + destination_ip.packed
+        + struct.pack("!HH", source_port, destination_port)
     )
     encoded_tlvs = b"".join(
         struct.pack("!BH", tlv_type, len(value)) + value for tlv_type, value in tlvs
     )
     crc_value_offset = None
     if include_crc:
-        crc_value_offset = FIXED_HEADER_BYTES + len(address_block) + len(encoded_tlvs) + 3
+        crc_value_offset = (
+            FIXED_HEADER_BYTES + len(address_block) + len(encoded_tlvs) + 3
+        )
         encoded_tlvs += struct.pack("!BH", TLV_CRC32C, 4) + b"\x00" * 4
     payload = address_block + encoded_tlvs
     header = bytearray(
@@ -82,7 +120,9 @@ def test_crc32c_known_vector() -> None:
 
 
 def test_accepts_ipv4_and_returns_endpoints_only_to_caller() -> None:
-    result = admit_proxy_v2(build_header(), immediate_peer="10.10.0.12", policy=policy())
+    result = admit_proxy_v2(
+        build_header(), immediate_peer="10.10.0.12", policy=policy()
+    )
     assert result.accepted
     assert result.metadata is not None
     assert result.metadata.source_address == "198.51.100.7"
@@ -255,6 +295,119 @@ def test_reader_rejects_short_declared_payload() -> None:
         read_proxy_v2_header(io.BytesIO(fixed + b"x"), max_header_bytes=4096)
 
 
+def test_socket_reader_preserves_application_bytes_and_timeout() -> None:
+    header = build_header()
+    application = b"GET /health HTTP/1.1\r\n"
+    sender, receiver = socket.socketpair()
+    try:
+        receiver.settimeout(1.25)
+        sender.sendall(header + application)
+
+        assert (
+            read_proxy_v2_socket(
+                receiver,
+                max_header_bytes=4096,
+                read_timeout_seconds=0.5,
+            )
+            == header
+        )
+        assert receiver.gettimeout() == 1.25
+        assert receiver.recv(len(application)) == application
+    finally:
+        sender.close()
+        receiver.close()
+
+
+def test_socket_reader_uses_one_shrinking_monotonic_budget() -> None:
+    header = build_header()
+    clock_state = [10.0]
+    connection = ScriptedSocket([header[:16], header[16:]], clock_state)
+
+    assert (
+        read_proxy_v2_socket(
+            connection,
+            max_header_bytes=4096,
+            read_timeout_seconds=0.5,
+            clock=lambda: clock_state[0],
+        )
+        == header
+    )
+
+    assert connection.timeout_history[:2] == pytest.approx([0.5, 0.4])
+    assert connection.timeout_history[-1] == 7.0
+
+
+def test_socket_reader_classifies_timeout_and_restores_prior_timeout() -> None:
+    clock_state = [10.0]
+    connection = TimingOutSocket([], clock_state)
+
+    with pytest.raises(
+        HeaderReadDeadlineExceeded, match="proxy_header_deadline_exceeded"
+    ):
+        read_proxy_v2_socket(
+            connection,
+            max_header_bytes=4096,
+            read_timeout_seconds=0.25,
+            clock=lambda: clock_state[0],
+        )
+
+    assert connection.timeout_history == [0.25, 7.0]
+
+
+def test_socket_reader_deadline_spans_all_partial_reads() -> None:
+    header = build_header()
+    clock_state = [10.0]
+    connection = ScriptedSocket(
+        [header[:16], header[16:20], header[20:]],
+        clock_state,
+    )
+
+    with pytest.raises(
+        HeaderReadDeadlineExceeded, match="proxy_header_deadline_exceeded"
+    ):
+        read_proxy_v2_socket(
+            connection,
+            max_header_bytes=4096,
+            read_timeout_seconds=0.15,
+            clock=lambda: clock_state[0],
+        )
+
+    assert connection.timeout_history[:2] == pytest.approx([0.15, 0.05])
+    assert connection.timeout_history[-1] == 7.0
+    assert connection.chunks == [header[20:]]
+
+
+def test_socket_reader_rejects_oversize_before_payload_recv() -> None:
+    fixed = SIGNATURE + b"\x21\x11" + struct.pack("!H", 5000)
+    clock_state = [10.0]
+    connection = ScriptedSocket([fixed], clock_state)
+
+    with pytest.raises(PolicyRejected, match="header_size_exceeded"):
+        read_proxy_v2_socket(
+            connection,
+            max_header_bytes=4096,
+            read_timeout_seconds=0.5,
+            clock=lambda: clock_state[0],
+        )
+
+    assert connection.chunks == []
+    assert connection.timeout_history[-1] == 7.0
+
+
+@pytest.mark.parametrize("timeout", [True, 0, -1, math.nan, math.inf, 30.1])
+def test_socket_reader_rejects_invalid_deadline(timeout: float) -> None:
+    connection = ScriptedSocket([], [10.0])
+
+    with pytest.raises(ValueError, match="read timeout"):
+        read_proxy_v2_socket(
+            connection,
+            max_header_bytes=4096,
+            read_timeout_seconds=timeout,
+        )
+
+    assert connection.timeout_history == []
+
+
 def test_cli_exit_codes_and_privacy_reduced_output(tmp_path, capsys) -> None:
     header_path = tmp_path / "header.bin"
     policy_path = tmp_path / "policy.json"
@@ -291,7 +444,9 @@ def test_cli_exit_codes_and_privacy_reduced_output(tmp_path, capsys) -> None:
         "x" * 65537,
     ],
 )
-def test_cli_rejects_ambiguous_or_oversized_policy(invalid_policy: str, tmp_path, capsys) -> None:
+def test_cli_rejects_ambiguous_or_oversized_policy(
+    invalid_policy: str, tmp_path, capsys
+) -> None:
     header_path = tmp_path / "header.bin"
     policy_path = tmp_path / "policy.json"
     header_path.write_bytes(build_header())

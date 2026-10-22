@@ -29,7 +29,7 @@ Read exactly one preamble from the accepted byte stream, then admit it with the
 kernel-observed peer address:
 
 ```python
-from tools.proxy_v2 import ProxyV2Policy, admit_proxy_v2, read_proxy_v2_header
+from tools.proxy_v2 import ProxyV2Policy, admit_proxy_v2, read_proxy_v2_socket
 
 policy = ProxyV2Policy.from_strings(
     trusted_proxy_cidrs=("10.10.0.0/24",),
@@ -37,7 +37,11 @@ policy = ProxyV2Policy.from_strings(
     destination_ports=(8443,),
 )
 
-header = read_proxy_v2_header(stream, max_header_bytes=policy.max_header_bytes)
+header = read_proxy_v2_socket(
+    accepted_socket,
+    max_header_bytes=policy.max_header_bytes,
+    read_timeout_seconds=0.250,
+)
 result = admit_proxy_v2(header, immediate_peer=socket_peer_ip, policy=policy)
 if not result.accepted:
     close_connection_without_parsing_application_bytes()
@@ -47,8 +51,12 @@ metadata = result.metadata
 The listener must derive `socket_peer_ip` from the accepted socket, never from the
 header or an HTTP field. On any malformed or rejected result it must close the
 connection; silently falling back to the socket peer creates an ambiguous protocol
-boundary. Enforce a read deadline around `read_proxy_v2_header` in the serving
-runtime to prevent slow-preamble connection exhaustion.
+boundary. `read_proxy_v2_socket` applies one monotonic deadline across every
+partial `recv`, tightens the socket timeout to the remaining budget, and restores
+the prior timeout before returning. A timeout raises
+`HeaderReadDeadlineExceeded`; the listener must close that connection without
+passing any bytes to the application parser. The deadline is capped at 30 seconds
+to prevent accidental unbounded configuration.
 
 ## Offline audit CLI
 
@@ -81,6 +89,9 @@ rejected instead of inheriting permissive JSON-parser behavior.
 - This module does not configure Nginx, HAProxy, Uvicorn or a cloud load balancer.
   Producer/consumer versions and whether a CRC TLV is emitted must be tested in the
   deployed path.
+- The socket deadline bounds preamble reads but cannot authenticate the load
+  balancer, cap the total number of accepted sockets, or replace listener-level
+  connection and concurrency limits.
 - Hashes are evidence identifiers, not secrecy controls; low-entropy headers may be
   guessable and evidence still requires access control.
 
