@@ -51,6 +51,8 @@ This makes proxy retry/failover behavior visible. The Nginx config uses connecti
 | `nginx.conf` | Layer-7 reverse proxy, least-connection balancing, keep-alive and timeout policy |
 | `tools/network_probe.py` | DNS resolution → TCP connect → HTTP request timing |
 | `tools/load_demo.py` | concurrency, throughput, latency percentiles and backend distribution |
+| `tools/connection_limiter.py` | non-queuing listener concurrency leases and low-cardinality saturation metrics |
+| `tools/proxy_v2.py` | strict, deadline-aware PROXY v2 admission before application parsing |
 | `docker-compose.yml` | edge/private network segmentation and service discovery by DNS name |
 
 ## Interview map
