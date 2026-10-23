@@ -30,7 +30,8 @@ kernel-observed peer address:
 
 ```python
 from tools.connection_limiter import ConnectionLimitPolicy, ConnectionLimiter
-from tools.proxy_v2 import ProxyV2Policy, admit_proxy_v2, read_proxy_v2_socket
+from tools.listener_admission import admit_listener_connection
+from tools.proxy_v2 import ProxyV2Policy
 
 policy = ProxyV2Policy.from_strings(
     trusted_proxy_cidrs=("10.10.0.0/24",),
@@ -40,14 +41,16 @@ policy = ProxyV2Policy.from_strings(
 
 limiter = ConnectionLimiter(ConnectionLimitPolicy(max_in_flight=256))
 
-# Acquire immediately after accept() and retain the slot until the socket closes.
-with limiter.acquire():
-    header = read_proxy_v2_socket(
-        accepted_socket,
-        max_header_bytes=policy.max_header_bytes,
-        read_timeout_seconds=0.250,
-    )
-    result = admit_proxy_v2(header, immediate_peer=socket_peer_ip, policy=policy)
+# The adapter acquires immediately, admits the preamble under one deadline, and
+# releases capacity on every rejected/error path. Acceptance retains the lease.
+with admit_listener_connection(
+    accepted_socket,
+    immediate_peer=socket_peer_ip,
+    limiter=limiter,
+    proxy_policy=policy,
+    read_timeout_seconds=0.250,
+) as result:
+    emit_structured_log(result.evidence.as_dict())
     if result.accepted:
         handle_application_connection(result.metadata)
     else:
@@ -71,6 +74,15 @@ a second wait outside the preamble deadline. A lease is released on normal retur
 or exception, repeated cleanup is idempotent, and snapshots expose only a fixed,
 low-cardinality metric set: in-flight, available, admitted, rejected and high-watermark.
 The policy permits 1–65,536 slots and has a deterministic SHA-256 identifier.
+
+`admit_listener_connection` composes both controls into one fail-closed boundary.
+Capacity exhaustion is decided before any socket read. All failures after lease
+acquisition release the slot, while an accepted result retains it until explicit
+release or context-manager exit. Its structured evidence binds the capacity policy,
+PROXY policy and parser evidence digests without recording raw IP addresses, ports,
+unique IDs or internal lease tokens. The digest detects edited records but is not an
+authentication mechanism; ship logs over an authenticated channel and protect the
+destination against deletion or rollback.
 
 ## Offline audit CLI
 
@@ -110,6 +122,6 @@ rejected instead of inheriting permissive JSON-parser behavior.
 - Hashes are evidence identifiers, not secrecy controls; low-entropy headers may be
   guessable and evidence still requires access control.
 
-The next integration step is a loopback TCP fixture or pinned proxy container that
-sends real preambles into a small adapter, proves application bytes remain framed,
-and binds the accepted evidence digest and capacity outcome to connection logs.
+The next integration step is a pinned proxy container that sends real preambles
+through this adapter, proves application bytes remain framed, and exports the
+evidence to an authenticated append-only log destination.
