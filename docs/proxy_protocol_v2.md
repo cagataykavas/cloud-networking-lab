@@ -29,6 +29,7 @@ Read exactly one preamble from the accepted byte stream, then admit it with the
 kernel-observed peer address:
 
 ```python
+from tools.connection_limiter import ConnectionLimitPolicy, ConnectionLimiter
 from tools.proxy_v2 import ProxyV2Policy, admit_proxy_v2, read_proxy_v2_socket
 
 policy = ProxyV2Policy.from_strings(
@@ -37,15 +38,20 @@ policy = ProxyV2Policy.from_strings(
     destination_ports=(8443,),
 )
 
-header = read_proxy_v2_socket(
-    accepted_socket,
-    max_header_bytes=policy.max_header_bytes,
-    read_timeout_seconds=0.250,
-)
-result = admit_proxy_v2(header, immediate_peer=socket_peer_ip, policy=policy)
-if not result.accepted:
-    close_connection_without_parsing_application_bytes()
-metadata = result.metadata
+limiter = ConnectionLimiter(ConnectionLimitPolicy(max_in_flight=256))
+
+# Acquire immediately after accept() and retain the slot until the socket closes.
+with limiter.acquire():
+    header = read_proxy_v2_socket(
+        accepted_socket,
+        max_header_bytes=policy.max_header_bytes,
+        read_timeout_seconds=0.250,
+    )
+    result = admit_proxy_v2(header, immediate_peer=socket_peer_ip, policy=policy)
+    if result.accepted:
+        handle_application_connection(result.metadata)
+    else:
+        close_connection_without_parsing_application_bytes()
 ```
 
 The listener must derive `socket_peer_ip` from the accepted socket, never from the
@@ -57,6 +63,14 @@ the prior timeout before returning. A timeout raises
 `HeaderReadDeadlineExceeded`; the listener must close that connection without
 passing any bytes to the application parser. The deadline is capped at 30 seconds
 to prevent accidental unbounded configuration.
+
+`ConnectionLimiter.acquire()` is deliberately non-blocking: when every handler slot
+is occupied it raises `connection_capacity_exceeded`, and the listener must close
+the newly accepted socket without reading its preamble. Queuing there would create
+a second wait outside the preamble deadline. A lease is released on normal return
+or exception, repeated cleanup is idempotent, and snapshots expose only a fixed,
+low-cardinality metric set: in-flight, available, admitted, rejected and high-watermark.
+The policy permits 1–65,536 slots and has a deterministic SHA-256 identifier.
 
 ## Offline audit CLI
 
@@ -89,12 +103,13 @@ rejected instead of inheriting permissive JSON-parser behavior.
 - This module does not configure Nginx, HAProxy, Uvicorn or a cloud load balancer.
   Producer/consumer versions and whether a CRC TLV is emitted must be tested in the
   deployed path.
-- The socket deadline bounds preamble reads but cannot authenticate the load
-  balancer, cap the total number of accepted sockets, or replace listener-level
-  connection and concurrency limits.
+- The limiter caps sockets admitted to application handlers; it does not bound the
+  kernel accept backlog, process file descriptors, SYN queue, load-balancer retries
+  or capacity across multiple processes/hosts. Those need separate OS and
+  infrastructure limits plus aggregation of per-worker metrics.
 - Hashes are evidence identifiers, not secrecy controls; low-entropy headers may be
   guessable and evidence still requires access control.
 
 The next integration step is a loopback TCP fixture or pinned proxy container that
 sends real preambles into a small adapter, proves application bytes remain framed,
-and binds the accepted evidence digest to connection logs.
+and binds the accepted evidence digest and capacity outcome to connection logs.
