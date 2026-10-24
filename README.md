@@ -53,6 +53,7 @@ This makes proxy retry/failover behavior visible. The Nginx config uses connecti
 | `tools/load_demo.py` | concurrency, throughput, latency percentiles and backend distribution |
 | `tools/connection_limiter.py` | non-queuing listener concurrency leases and low-cardinality saturation metrics |
 | `tools/listener_admission.py` | composed capacity + PROXY v2 boundary with privacy-reduced audit evidence |
+| `docs/graceful_listener_drain.md` | bounded, fail-closed listener draining for rolling deployments |
 | `tools/proxy_v2.py` | strict, deadline-aware PROXY v2 admission before application parsing |
 | `docker-compose.yml` | edge/private network segmentation and service discovery by DNS name |
 
