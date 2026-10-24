@@ -10,6 +10,7 @@ from tools.connection_limiter import (
     ConnectionCapacityExceeded,
     ConnectionLease,
     ConnectionLimiter,
+    ListenerDraining,
 )
 from tools.proxy_v2 import (
     HeaderReadDeadlineExceeded,
@@ -33,6 +34,7 @@ class ConnectionAdmissionEvidence:
     proxy_evidence_sha256: str | None
     header_bytes: int | None
     address_family: str | None
+    listener_state: str
     evidence_sha256: str
 
     def as_dict(self) -> dict[str, int | str | None]:
@@ -83,15 +85,17 @@ def _evidence(
     header_bytes: int | None = None,
     address_family: str | None = None,
 ) -> ConnectionAdmissionEvidence:
+    listener_state = limiter.snapshot().lifecycle_state
     document = {
         "address_family": address_family,
         "capacity_policy_sha256": limiter.policy.digest,
         "header_bytes": header_bytes,
+        "listener_state": listener_state,
         "outcome": outcome,
         "proxy_evidence_sha256": proxy_evidence_sha256,
         "proxy_policy_sha256": proxy_policy.digest,
         "reason": reason,
-        "schema_version": 1,
+        "schema_version": 2,
     }
     return ConnectionAdmissionEvidence(
         **document,
@@ -105,7 +109,7 @@ def verify_connection_admission_evidence(
     """Verify content integrity; this SHA-256 digest is not authentication."""
     document = evidence.as_dict()
     claimed = document.pop("evidence_sha256")
-    if evidence.schema_version != 1 or not isinstance(claimed, str):
+    if evidence.schema_version != 2 or not isinstance(claimed, str):
         return False
     return hmac.compare_digest(claimed, _sha256_json(document))
 
@@ -126,6 +130,16 @@ def admit_listener_connection(
     """
     try:
         lease = limiter.acquire()
+    except ListenerDraining:
+        return ListenerAdmissionResult(
+            evidence=_evidence(
+                outcome="rejected",
+                reason=ListenerDraining.code,
+                limiter=limiter,
+                proxy_policy=proxy_policy,
+            ),
+            metadata=None,
+        )
     except ConnectionCapacityExceeded:
         return ListenerAdmissionResult(
             evidence=_evidence(
