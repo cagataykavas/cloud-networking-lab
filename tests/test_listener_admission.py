@@ -133,6 +133,28 @@ def test_capacity_rejection_happens_before_socket_read() -> None:
         receiver.close()
 
 
+def test_drain_rejection_happens_before_socket_read_and_binds_state() -> None:
+    limiter = ConnectionLimiter(ConnectionLimitPolicy(max_in_flight=1))
+    connection = BufferedSocket(build_header())
+    assert limiter.begin_drain()
+
+    result = admit_listener_connection(
+        connection,
+        immediate_peer="10.10.0.12",
+        limiter=limiter,
+        proxy_policy=policy(),
+        read_timeout_seconds=0.25,
+    )
+
+    assert not result.accepted
+    assert result.evidence.reason == "listener_draining"
+    assert result.evidence.listener_state == "drained"
+    assert result.evidence.schema_version == 2
+    assert connection.read_calls == 0
+    assert limiter.snapshot().draining_rejected_total == 1
+    assert verify_connection_admission_evidence(result.evidence)
+
+
 def test_parallel_composed_admission_never_reads_rejected_connections() -> None:
     worker_count = 64
     capacity = 8
@@ -261,6 +283,9 @@ def test_evidence_is_privacy_reduced_and_tamper_evident() -> None:
             assert verify_connection_admission_evidence(result.evidence)
             assert not verify_connection_admission_evidence(
                 replace(result.evidence, reason="accepted-but-edited")
+            )
+            assert not verify_connection_admission_evidence(
+                replace(result.evidence, listener_state="draining")
             )
     finally:
         sender.close()
