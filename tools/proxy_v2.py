@@ -167,6 +167,7 @@ class AdmissionEvidence:
     policy_sha256: str
     address_family: str | None
     tlv_types: tuple[str, ...]
+    unique_id_sha256: str | None
     header_bytes: int
     evidence_sha256: str
 
@@ -188,6 +189,7 @@ class _ParsedHeader:
     destination: Address
     address_family: str
     tlv_types: tuple[int, ...]
+    unique_id_sha256: str | None
 
 
 def _sha256_json(document: object) -> str:
@@ -229,9 +231,10 @@ def _parse_tlvs(
     *,
     offset: int,
     policy: ProxyV2Policy,
-) -> tuple[int, ...]:
+) -> tuple[tuple[int, ...], str | None]:
     tlv_types: list[int] = []
     crc_value_offset: int | None = None
+    unique_id_sha256: str | None = None
     while offset < len(header):
         if len(tlv_types) >= policy.max_tlvs:
             raise PolicyRejected("tlv_count_exceeded")
@@ -255,6 +258,8 @@ def _parse_tlvs(
             1 <= tlv_length <= policy.max_unique_id_bytes
         ):
             raise PolicyRejected("unique_id_size_invalid")
+        elif tlv_type == TLV_UNIQUE_ID:
+            unique_id_sha256 = hashlib.sha256(header[value_offset:end]).hexdigest()
         tlv_types.append(tlv_type)
         offset = end
 
@@ -266,7 +271,7 @@ def _parse_tlvs(
         zeroed[crc_value_offset : crc_value_offset + 4] = b"\x00" * 4
         if crc32c(bytes(zeroed)) != claimed:
             raise MalformedHeader("crc32c_mismatch")
-    return tuple(tlv_types)
+    return tuple(tlv_types), unique_id_sha256
 
 
 def _parse(header: bytes, policy: ProxyV2Policy) -> _ParsedHeader:
@@ -317,7 +322,7 @@ def _parse(header: bytes, policy: ProxyV2Policy) -> _ParsedHeader:
     if destination_port == 0:
         raise PolicyRejected("destination_port_zero")
 
-    tlv_types = _parse_tlvs(
+    tlv_types, unique_id_sha256 = _parse_tlvs(
         header,
         offset=FIXED_HEADER_BYTES + address_bytes,
         policy=policy,
@@ -334,6 +339,7 @@ def _parse(header: bytes, policy: ProxyV2Policy) -> _ParsedHeader:
         destination=destination,
         address_family=address_family,
         tlv_types=tlv_types,
+        unique_id_sha256=unique_id_sha256,
     )
 
 
@@ -345,6 +351,7 @@ def _evidence(
     policy: ProxyV2Policy,
     address_family: str | None = None,
     tlv_types: tuple[int, ...] = (),
+    unique_id_sha256: str | None = None,
 ) -> AdmissionEvidence:
     document = {
         "address_family": address_family,
@@ -353,8 +360,9 @@ def _evidence(
         "outcome": outcome,
         "policy_sha256": policy.digest,
         "reason": reason,
-        "schema_version": 1,
+        "schema_version": 2,
         "tlv_types": [f"0x{value:02x}" for value in tlv_types],
+        "unique_id_sha256": unique_id_sha256,
     }
     return AdmissionEvidence(
         **document,
@@ -401,6 +409,7 @@ def admit_proxy_v2(
             policy=policy,
             address_family=parsed.address_family,
             tlv_types=parsed.tlv_types,
+            unique_id_sha256=parsed.unique_id_sha256,
         ),
         metadata=parsed.metadata,
     )

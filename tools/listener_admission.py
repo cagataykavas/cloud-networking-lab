@@ -22,6 +22,11 @@ from tools.proxy_v2 import (
     admit_proxy_v2,
     read_proxy_v2_socket,
 )
+from tools.replay_guard import (
+    ProxyHeaderReplay,
+    ProxyReplayGuard,
+    ReplayGuardCapacityExceeded,
+)
 
 
 @dataclass(frozen=True)
@@ -32,6 +37,7 @@ class ConnectionAdmissionEvidence:
     capacity_policy_sha256: str
     proxy_policy_sha256: str
     proxy_evidence_sha256: str | None
+    replay_policy_sha256: str | None
     header_bytes: int | None
     address_family: str | None
     listener_state: str
@@ -84,6 +90,7 @@ def _evidence(
     proxy_evidence_sha256: str | None = None,
     header_bytes: int | None = None,
     address_family: str | None = None,
+    replay_guard: ProxyReplayGuard | None = None,
 ) -> ConnectionAdmissionEvidence:
     listener_state = limiter.snapshot().lifecycle_state
     document = {
@@ -94,8 +101,11 @@ def _evidence(
         "outcome": outcome,
         "proxy_evidence_sha256": proxy_evidence_sha256,
         "proxy_policy_sha256": proxy_policy.digest,
+        "replay_policy_sha256": (
+            replay_guard.policy.digest if replay_guard is not None else None
+        ),
         "reason": reason,
-        "schema_version": 2,
+        "schema_version": 3,
     }
     return ConnectionAdmissionEvidence(
         **document,
@@ -109,7 +119,7 @@ def verify_connection_admission_evidence(
     """Verify content integrity; this SHA-256 digest is not authentication."""
     document = evidence.as_dict()
     claimed = document.pop("evidence_sha256")
-    if evidence.schema_version != 2 or not isinstance(claimed, str):
+    if evidence.schema_version != 3 or not isinstance(claimed, str):
         return False
     return hmac.compare_digest(claimed, _sha256_json(document))
 
@@ -121,12 +131,14 @@ def admit_listener_connection(
     limiter: ConnectionLimiter,
     proxy_policy: ProxyV2Policy,
     read_timeout_seconds: float,
+    replay_guard: ProxyReplayGuard | None = None,
 ) -> ListenerAdmissionResult:
     """Acquire capacity and admit one PROXY v2 connection without queuing.
 
-    Capacity rejection occurs before reading from the socket. Every failure after
-    acquisition releases the lease; a successful caller owns it until
-    ``ListenerAdmissionResult.release`` or context-manager exit.
+    Capacity rejection occurs before reading from the socket. When supplied, the
+    replay guard claims the validated, hashed PROXY unique ID before acceptance.
+    Every failure after acquisition releases the lease; a successful caller owns
+    it until ``ListenerAdmissionResult.release`` or context-manager exit.
     """
     try:
         lease = limiter.acquire()
@@ -137,6 +149,7 @@ def admit_listener_connection(
                 reason=ListenerDraining.code,
                 limiter=limiter,
                 proxy_policy=proxy_policy,
+                replay_guard=replay_guard,
             ),
             metadata=None,
         )
@@ -147,6 +160,7 @@ def admit_listener_connection(
                 reason=ConnectionCapacityExceeded.code,
                 limiter=limiter,
                 proxy_policy=proxy_policy,
+                replay_guard=replay_guard,
             ),
             metadata=None,
         )
@@ -166,6 +180,7 @@ def admit_listener_connection(
                     reason="proxy_header_deadline_exceeded",
                     limiter=limiter,
                     proxy_policy=proxy_policy,
+                    replay_guard=replay_guard,
                 ),
                 metadata=None,
             )
@@ -177,6 +192,7 @@ def admit_listener_connection(
                     reason=str(exc),
                     limiter=limiter,
                     proxy_policy=proxy_policy,
+                    replay_guard=replay_guard,
                 ),
                 metadata=None,
             )
@@ -188,6 +204,7 @@ def admit_listener_connection(
                     reason=str(exc),
                     limiter=limiter,
                     proxy_policy=proxy_policy,
+                    replay_guard=replay_guard,
                 ),
                 metadata=None,
             )
@@ -197,18 +214,65 @@ def admit_listener_connection(
             immediate_peer=immediate_peer,
             policy=proxy_policy,
         )
+        if not proxy_result.accepted:
+            lease.release()
+            return ListenerAdmissionResult(
+                evidence=_evidence(
+                    outcome=proxy_result.evidence.outcome,
+                    reason=proxy_result.evidence.reason,
+                    limiter=limiter,
+                    proxy_policy=proxy_policy,
+                    proxy_evidence_sha256=proxy_result.evidence.evidence_sha256,
+                    header_bytes=proxy_result.evidence.header_bytes,
+                    address_family=proxy_result.evidence.address_family,
+                    replay_guard=replay_guard,
+                ),
+                metadata=None,
+            )
+        if replay_guard is not None:
+            unique_id_sha256 = proxy_result.evidence.unique_id_sha256
+            if unique_id_sha256 is None:
+                lease.release()
+                return ListenerAdmissionResult(
+                    evidence=_evidence(
+                        outcome="rejected",
+                        reason="proxy_unique_id_required",
+                        limiter=limiter,
+                        proxy_policy=proxy_policy,
+                        proxy_evidence_sha256=proxy_result.evidence.evidence_sha256,
+                        header_bytes=proxy_result.evidence.header_bytes,
+                        address_family=proxy_result.evidence.address_family,
+                        replay_guard=replay_guard,
+                    ),
+                    metadata=None,
+                )
+            try:
+                replay_guard.claim(unique_id_sha256)
+            except (ProxyHeaderReplay, ReplayGuardCapacityExceeded) as exc:
+                lease.release()
+                return ListenerAdmissionResult(
+                    evidence=_evidence(
+                        outcome="rejected",
+                        reason=exc.code,
+                        limiter=limiter,
+                        proxy_policy=proxy_policy,
+                        proxy_evidence_sha256=proxy_result.evidence.evidence_sha256,
+                        header_bytes=proxy_result.evidence.header_bytes,
+                        address_family=proxy_result.evidence.address_family,
+                        replay_guard=replay_guard,
+                    ),
+                    metadata=None,
+                )
         evidence = _evidence(
-            outcome=proxy_result.evidence.outcome,
-            reason=proxy_result.evidence.reason,
+            outcome="accepted",
+            reason="accepted",
             limiter=limiter,
             proxy_policy=proxy_policy,
             proxy_evidence_sha256=proxy_result.evidence.evidence_sha256,
             header_bytes=proxy_result.evidence.header_bytes,
             address_family=proxy_result.evidence.address_family,
+            replay_guard=replay_guard,
         )
-        if not proxy_result.accepted:
-            lease.release()
-            return ListenerAdmissionResult(evidence=evidence, metadata=None)
         return ListenerAdmissionResult(
             evidence=evidence,
             metadata=proxy_result.metadata,
