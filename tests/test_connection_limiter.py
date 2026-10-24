@@ -10,6 +10,7 @@ from tools.connection_limiter import (
     ConnectionCapacityExceeded,
     ConnectionLimitPolicy,
     ConnectionLimiter,
+    ListenerDraining,
 )
 
 
@@ -89,6 +90,69 @@ def test_lease_release_is_idempotent_and_cannot_underflow() -> None:
     assert limiter.snapshot().in_flight == 0
 
 
+def test_drain_rejects_new_leases_and_preserves_existing_ownership() -> None:
+    limiter = ConnectionLimiter(ConnectionLimitPolicy(max_in_flight=2))
+    lease = limiter.acquire()
+
+    assert limiter.begin_drain() is True
+    assert limiter.begin_drain() is False
+    assert limiter.snapshot().lifecycle_state == "draining"
+    with pytest.raises(ListenerDraining, match="listener_draining"):
+        limiter.acquire()
+
+    snapshot = limiter.snapshot()
+    assert snapshot.in_flight == 1
+    assert snapshot.rejected_total == 1
+    assert snapshot.draining_rejected_total == 1
+    assert limiter.wait_for_drain(0) is False
+
+    assert lease.release()
+    assert limiter.wait_for_drain(0) is True
+    assert limiter.snapshot().lifecycle_state == "drained"
+
+
+def test_wait_for_drain_unblocks_only_after_last_lease_releases() -> None:
+    limiter = ConnectionLimiter(ConnectionLimitPolicy(max_in_flight=2))
+    first = limiter.acquire()
+    second = limiter.acquire()
+    limiter.begin_drain()
+    waiter_started = threading.Event()
+
+    def wait_for_shutdown() -> bool:
+        waiter_started.set()
+        return limiter.wait_for_drain(1)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(wait_for_shutdown)
+        assert waiter_started.wait(timeout=1)
+        assert first.release()
+        assert not future.done()
+        assert second.release()
+        assert future.result(timeout=1) is True
+
+
+def test_wait_for_drain_requires_explicit_transition() -> None:
+    limiter = ConnectionLimiter()
+    with pytest.raises(RuntimeError, match="listener_drain_not_started"):
+        limiter.wait_for_drain(0)
+
+
+def test_drain_empty_listener_is_immediate_and_idempotent() -> None:
+    limiter = ConnectionLimiter()
+
+    assert limiter.drain(0) is True
+    assert limiter.drain(0) is True
+    assert limiter.snapshot().lifecycle_state == "drained"
+
+
+@pytest.mark.parametrize("value", [True, -1, float("inf"), float("nan"), 3_601, "1"])
+def test_drain_rejects_invalid_or_unbounded_timeouts(value: object) -> None:
+    limiter = ConnectionLimiter()
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        limiter.drain(value)  # type: ignore[arg-type]
+    assert limiter.snapshot().lifecycle_state == "accepting"
+
+
 @pytest.mark.parametrize("value", [True, 0, -1, 65_537, 1.5, "8"])
 def test_policy_rejects_unbounded_or_ambiguous_capacity(value: object) -> None:
     with pytest.raises(ValueError, match="max_in_flight"):
@@ -109,6 +173,8 @@ def test_policy_digest_and_snapshot_are_deterministic_and_low_cardinality() -> N
         "available": 3,
         "admitted_total": 1,
         "rejected_total": 0,
+        "draining_rejected_total": 0,
         "high_watermark": 1,
         "policy_sha256": first.policy.digest,
+        "lifecycle_state": "accepting",
     }
