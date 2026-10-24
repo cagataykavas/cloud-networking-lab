@@ -55,6 +55,8 @@ This makes proxy retry/failover behavior visible. The Nginx config uses connecti
 | `tools/listener_admission.py` | composed capacity + PROXY v2 boundary with privacy-reduced audit evidence |
 | `docs/graceful_listener_drain.md` | bounded, fail-closed listener draining for rolling deployments |
 | `tools/proxy_v2.py` | strict, deadline-aware PROXY v2 admission before application parsing |
+| `tools/replay_guard.py` | bounded, thread-safe TTL claims for PROXY unique-ID replay rejection |
+| `docs/proxy_v2_replay_guard.md` | replay threat model, sizing and multi-process boundary |
 | `docker-compose.yml` | edge/private network segmentation and service discovery by DNS name |
 
 ## Interview map

@@ -32,6 +32,7 @@ kernel-observed peer address:
 from tools.connection_limiter import ConnectionLimitPolicy, ConnectionLimiter
 from tools.listener_admission import admit_listener_connection
 from tools.proxy_v2 import ProxyV2Policy
+from tools.replay_guard import ProxyReplayGuard, ReplayGuardPolicy
 
 policy = ProxyV2Policy.from_strings(
     trusted_proxy_cidrs=("10.10.0.0/24",),
@@ -40,6 +41,9 @@ policy = ProxyV2Policy.from_strings(
 )
 
 limiter = ConnectionLimiter(ConnectionLimitPolicy(max_in_flight=256))
+replay_guard = ProxyReplayGuard(
+    ReplayGuardPolicy(ttl_seconds=300, max_entries=65_536)
+)
 
 # The adapter acquires immediately, admits the preamble under one deadline, and
 # releases capacity on every rejected/error path. Acceptance retains the lease.
@@ -48,6 +52,7 @@ with admit_listener_connection(
     immediate_peer=socket_peer_ip,
     limiter=limiter,
     proxy_policy=policy,
+    replay_guard=replay_guard,
     read_timeout_seconds=0.250,
 ) as result:
     emit_structured_log(result.evidence.as_dict())
@@ -79,10 +84,12 @@ The policy permits 1–65,536 slots and has a deterministic SHA-256 identifier.
 Capacity exhaustion is decided before any socket read. All failures after lease
 acquisition release the slot, while an accepted result retains it until explicit
 release or context-manager exit. Its structured evidence binds the capacity policy,
-PROXY policy and parser evidence digests without recording raw IP addresses, ports,
-unique IDs or internal lease tokens. The digest detects edited records but is not an
-authentication mechanism; ship logs over an authenticated channel and protect the
-destination against deletion or rollback.
+PROXY policy, optional replay policy and parser evidence digests without recording
+raw IP addresses, ports, unique IDs or internal lease tokens. When configured, the
+replay guard requires a UNIQUE_ID TLV and rejects a repeated hashed identifier or a
+full bounded claim set before application handling. The evidence digest detects
+edited records but is not an authentication mechanism; ship logs over an
+authenticated channel and protect the destination against deletion or rollback.
 
 ## Offline audit CLI
 

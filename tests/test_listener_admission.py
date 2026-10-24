@@ -23,6 +23,7 @@ from tools.proxy_v2 import (
     ProxyV2Policy,
     crc32c,
 )
+from tools.replay_guard import ProxyReplayGuard, ReplayGuardPolicy
 
 
 def policy() -> ProxyV2Policy:
@@ -33,13 +34,21 @@ def policy() -> ProxyV2Policy:
     )
 
 
-def build_header(*, destination: str = "10.20.0.8") -> bytes:
+def build_header(
+    *,
+    destination: str = "10.20.0.8",
+    unique_id_value: bytes | None = b"request-17",
+) -> bytes:
     address_block = (
         ipaddress.ip_address("198.51.100.7").packed
         + ipaddress.ip_address(destination).packed
         + struct.pack("!HH", 53000, 443)
     )
-    unique_id = struct.pack("!BH", TLV_UNIQUE_ID, 10) + b"request-17"
+    unique_id = (
+        b""
+        if unique_id_value is None
+        else struct.pack("!BH", TLV_UNIQUE_ID, len(unique_id_value)) + unique_id_value
+    )
     crc_offset = FIXED_HEADER_BYTES + len(address_block) + len(unique_id) + 3
     payload = address_block + unique_id + struct.pack("!BH", TLV_CRC32C, 4) + b"\0" * 4
     header = bytearray(
@@ -149,7 +158,7 @@ def test_drain_rejection_happens_before_socket_read_and_binds_state() -> None:
     assert not result.accepted
     assert result.evidence.reason == "listener_draining"
     assert result.evidence.listener_state == "drained"
-    assert result.evidence.schema_version == 2
+    assert result.evidence.schema_version == 3
     assert connection.read_calls == 0
     assert limiter.snapshot().draining_rejected_total == 1
     assert verify_connection_admission_evidence(result.evidence)
@@ -290,3 +299,138 @@ def test_evidence_is_privacy_reduced_and_tamper_evident() -> None:
     finally:
         sender.close()
         receiver.close()
+
+
+def test_replay_guard_rejects_reused_unique_id_and_releases_capacity() -> None:
+    limiter = ConnectionLimiter(ConnectionLimitPolicy(max_in_flight=2))
+    replay_guard = ProxyReplayGuard(ReplayGuardPolicy(ttl_seconds=30, max_entries=8))
+    first_connection = BufferedSocket(build_header(unique_id_value=b"request-17"))
+    replayed_connection = BufferedSocket(
+        build_header(
+            destination="10.20.0.9",
+            unique_id_value=b"request-17",
+        )
+    )
+
+    first = admit_listener_connection(
+        first_connection,
+        immediate_peer="10.10.0.12",
+        limiter=limiter,
+        proxy_policy=policy(),
+        read_timeout_seconds=0.25,
+        replay_guard=replay_guard,
+    )
+    replayed = admit_listener_connection(
+        replayed_connection,
+        immediate_peer="10.10.0.12",
+        limiter=limiter,
+        proxy_policy=policy(),
+        read_timeout_seconds=0.25,
+        replay_guard=replay_guard,
+    )
+
+    assert first.accepted
+    assert not replayed.accepted
+    assert replayed.evidence.reason == "proxy_header_replay"
+    assert replayed.evidence.replay_policy_sha256 == replay_guard.policy.digest
+    assert verify_connection_admission_evidence(replayed.evidence)
+    assert not verify_connection_admission_evidence(
+        replace(replayed.evidence, replay_policy_sha256="0" * 64)
+    )
+    assert limiter.snapshot().in_flight == 1
+    assert first.release()
+    assert limiter.snapshot().in_flight == 0
+
+
+def test_replay_guard_requires_unique_id_without_leaking_header_fields() -> None:
+    limiter = ConnectionLimiter(ConnectionLimitPolicy(max_in_flight=1))
+    replay_guard = ProxyReplayGuard()
+    connection = BufferedSocket(build_header(unique_id_value=None))
+
+    result = admit_listener_connection(
+        connection,
+        immediate_peer="10.10.0.12",
+        limiter=limiter,
+        proxy_policy=policy(),
+        read_timeout_seconds=0.25,
+        replay_guard=replay_guard,
+    )
+
+    assert not result.accepted
+    assert result.evidence.reason == "proxy_unique_id_required"
+    assert result.evidence.proxy_evidence_sha256 is not None
+    assert "request-17" not in str(result.evidence.as_dict())
+    assert replay_guard.snapshot().claimed_total == 0
+    assert limiter.snapshot().in_flight == 0
+
+
+def test_replay_guard_capacity_rejection_releases_listener_capacity() -> None:
+    limiter = ConnectionLimiter(ConnectionLimitPolicy(max_in_flight=1))
+    replay_guard = ProxyReplayGuard(ReplayGuardPolicy(ttl_seconds=30, max_entries=1))
+
+    first = admit_listener_connection(
+        BufferedSocket(build_header(unique_id_value=b"request-1")),
+        immediate_peer="10.10.0.12",
+        limiter=limiter,
+        proxy_policy=policy(),
+        read_timeout_seconds=0.25,
+        replay_guard=replay_guard,
+    )
+    assert first.accepted
+    assert first.release()
+
+    second = admit_listener_connection(
+        BufferedSocket(build_header(unique_id_value=b"request-2")),
+        immediate_peer="10.10.0.12",
+        limiter=limiter,
+        proxy_policy=policy(),
+        read_timeout_seconds=0.25,
+        replay_guard=replay_guard,
+    )
+
+    assert not second.accepted
+    assert second.evidence.reason == "replay_guard_capacity_exceeded"
+    assert replay_guard.snapshot().capacity_rejected_total == 1
+    assert limiter.snapshot().in_flight == 0
+
+
+def test_parallel_replay_claim_allows_exactly_one_connection() -> None:
+    worker_count = 64
+    limiter = ConnectionLimiter(ConnectionLimitPolicy(max_in_flight=worker_count))
+    replay_guard = ProxyReplayGuard(
+        ReplayGuardPolicy(ttl_seconds=30, max_entries=worker_count)
+    )
+    proxy_policy = policy()
+    connections = [
+        BufferedSocket(build_header(unique_id_value=b"same-request"))
+        for _ in range(worker_count)
+    ]
+    start = threading.Barrier(worker_count + 1)
+
+    def attempt(connection: BufferedSocket):
+        start.wait()
+        return admit_listener_connection(
+            connection,
+            immediate_peer="10.10.0.12",
+            limiter=limiter,
+            proxy_policy=proxy_policy,
+            read_timeout_seconds=0.25,
+            replay_guard=replay_guard,
+        )
+
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        futures = [pool.submit(attempt, connection) for connection in connections]
+        start.wait()
+        results = [future.result(timeout=5) for future in futures]
+
+    accepted = [result for result in results if result.accepted]
+    rejected = [result for result in results if not result.accepted]
+    assert len(accepted) == 1
+    assert len(rejected) == worker_count - 1
+    assert {result.evidence.reason for result in rejected} == {"proxy_header_replay"}
+    snapshot = replay_guard.snapshot()
+    assert snapshot.claimed_total == 1
+    assert snapshot.replay_rejected_total == worker_count - 1
+    assert limiter.snapshot().in_flight == 1
+    assert accepted[0].release()
+    assert limiter.snapshot().in_flight == 0

@@ -128,9 +128,12 @@ def test_accepts_ipv4_and_returns_endpoints_only_to_caller() -> None:
     assert result.metadata.source_address == "198.51.100.7"
     assert result.metadata.destination_address == "10.20.0.8"
     assert result.evidence.address_family == "inet"
+    assert result.evidence.schema_version == 2
+    assert result.evidence.unique_id_sha256 is not None
     serialized_evidence = str(result.evidence)
     assert "198.51.100.7" not in serialized_evidence
     assert "10.20.0.8" not in serialized_evidence
+    assert b"request-17".decode() not in serialized_evidence
 
 
 def test_accepts_ipv6() -> None:
