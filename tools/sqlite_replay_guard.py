@@ -320,109 +320,102 @@ class SQLiteReplayGuard:
                 connection.execute("BEGIN IMMEDIATE")
                 now, clock_error = self._observe_clock(connection, self._now())
                 if clock_error is not None:
-                    decision = _Decision(clock_error)
-                else:
-                    self._expire(connection, now)
-                    existing = connection.execute(
-                        """
+                    connection.commit()
+                    raise clock_error
+                self._expire(connection, now)
+                existing = connection.execute(
+                    """
                     SELECT 1 FROM replay_guard_claims
                     WHERE namespace = ? AND unique_id_sha256 = ?
                     """,
-                        (self.policy.namespace, unique_id_sha256),
-                    ).fetchone()
-                    if existing is not None:
-                        connection.execute(
-                            """
+                    (self.policy.namespace, unique_id_sha256),
+                ).fetchone()
+                if existing is not None:
+                    connection.execute(
+                        """
                         UPDATE replay_guard_state
                         SET replay_rejected_total = replay_rejected_total + 1
                         WHERE namespace = ?
                         """,
-                            (self.policy.namespace,),
-                        )
-                        decision = _Decision(ProxyHeaderReplay())
-                    else:
-                        active_entries = connection.execute(
-                            """
+                        (self.policy.namespace,),
+                    )
+                    decision = _Decision(ProxyHeaderReplay())
+                else:
+                    active_entries = connection.execute(
+                        """
                         SELECT active_entries FROM replay_guard_state
                         WHERE namespace = ?
                         """,
-                            (self.policy.namespace,),
-                        ).fetchone()
-                        if active_entries is None:
-                            raise sqlite3.DatabaseError("replay guard state missing")
-                        if active_entries[0] >= self.policy.max_entries:
-                            connection.execute(
-                                """
+                        (self.policy.namespace,),
+                    ).fetchone()
+                    if active_entries is None:
+                        raise sqlite3.DatabaseError("replay guard state missing")
+                    if active_entries[0] >= self.policy.max_entries:
+                        connection.execute(
+                            """
                             UPDATE replay_guard_state
                             SET capacity_rejected_total = capacity_rejected_total + 1
                             WHERE namespace = ?
                             """,
-                                (self.policy.namespace,),
-                            )
-                            decision = _Decision(ReplayGuardCapacityExceeded())
-                        else:
-                            connection.execute(
-                                """
+                            (self.policy.namespace,),
+                        )
+                        decision = _Decision(ReplayGuardCapacityExceeded())
+                    else:
+                        connection.execute(
+                            """
                             INSERT INTO replay_guard_claims (
                                 namespace, unique_id_sha256, expires_at
                             ) VALUES (?, ?, ?)
                             """,
-                                (
-                                    self.policy.namespace,
-                                    unique_id_sha256,
-                                    now + float(self.policy.ttl_seconds),
-                                ),
-                            )
-                            connection.execute(
-                                """
+                            (
+                                self.policy.namespace,
+                                unique_id_sha256,
+                                now + float(self.policy.ttl_seconds),
+                            ),
+                        )
+                        connection.execute(
+                            """
                             UPDATE replay_guard_state
                             SET active_entries = active_entries + 1,
                                 claimed_total = claimed_total + 1
                             WHERE namespace = ?
                             """,
-                                (self.policy.namespace,),
-                            )
+                            (self.policy.namespace,),
+                        )
         except sqlite3.Error as exc:
             raise ReplayGuardUnavailable from exc
         if decision.error is not None:
             raise decision.error
 
     def snapshot(self) -> ReplayGuardSnapshot:
-        decision = _Decision()
-        snapshot: ReplayGuardSnapshot | None = None
         try:
             with closing(self._connect()) as connection, connection:
                 connection.execute("BEGIN IMMEDIATE")
                 now, clock_error = self._observe_clock(connection, self._now())
                 if clock_error is not None:
-                    decision = _Decision(clock_error)
-                else:
-                    self._expire(connection, now)
-                    row = connection.execute(
-                        """
+                    connection.commit()
+                    raise clock_error
+                self._expire(connection, now)
+                row = connection.execute(
+                    """
                     SELECT active_entries, claimed_total, replay_rejected_total,
                            capacity_rejected_total, expired_total,
                            clock_regression_rejected_total
                     FROM replay_guard_state WHERE namespace = ?
                     """,
-                        (self.policy.namespace,),
-                    ).fetchone()
-                    if row is None:
-                        raise sqlite3.DatabaseError("replay guard state missing")
-                    snapshot = ReplayGuardSnapshot(
-                        active_entries=row[0],
-                        max_entries=self.policy.max_entries,
-                        claimed_total=row[1],
-                        replay_rejected_total=row[2],
-                        capacity_rejected_total=row[3],
-                        expired_total=row[4],
-                        policy_sha256=self.policy.digest,
-                        clock_regression_rejected_total=row[5],
-                    )
+                    (self.policy.namespace,),
+                ).fetchone()
+                if row is None:
+                    raise sqlite3.DatabaseError("replay guard state missing")
+                return ReplayGuardSnapshot(
+                    active_entries=row[0],
+                    max_entries=self.policy.max_entries,
+                    claimed_total=row[1],
+                    replay_rejected_total=row[2],
+                    capacity_rejected_total=row[3],
+                    expired_total=row[4],
+                    policy_sha256=self.policy.digest,
+                    clock_regression_rejected_total=row[5],
+                )
         except sqlite3.Error as exc:
             raise ReplayGuardUnavailable from exc
-        if decision.error is not None:
-            raise decision.error
-        if snapshot is None:
-            raise ReplayGuardUnavailable
-        return snapshot
