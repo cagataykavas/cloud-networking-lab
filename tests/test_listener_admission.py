@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import socket
+import sqlite3
 import struct
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -24,6 +25,7 @@ from tools.proxy_v2 import (
     crc32c,
 )
 from tools.replay_guard import ProxyReplayGuard, ReplayGuardPolicy
+from tools.sqlite_replay_guard import SQLiteReplayGuard, SQLiteReplayGuardPolicy
 
 
 def policy() -> ProxyV2Policy:
@@ -433,4 +435,75 @@ def test_parallel_replay_claim_allows_exactly_one_connection() -> None:
     assert snapshot.replay_rejected_total == worker_count - 1
     assert limiter.snapshot().in_flight == 1
     assert accepted[0].release()
+    assert limiter.snapshot().in_flight == 0
+
+
+def test_sqlite_replay_guard_composes_with_listener_admission(tmp_path) -> None:
+    limiter = ConnectionLimiter(ConnectionLimitPolicy(max_in_flight=2))
+    replay_guard = SQLiteReplayGuard(
+        tmp_path / "replay.db",
+        SQLiteReplayGuardPolicy(
+            ttl_seconds=30,
+            max_entries=8,
+            namespace="listener-a",
+        ),
+    )
+
+    first = admit_listener_connection(
+        BufferedSocket(build_header(unique_id_value=b"shared-request")),
+        immediate_peer="10.10.0.12",
+        limiter=limiter,
+        proxy_policy=policy(),
+        read_timeout_seconds=0.25,
+        replay_guard=replay_guard,
+    )
+    replayed = admit_listener_connection(
+        BufferedSocket(build_header(unique_id_value=b"shared-request")),
+        immediate_peer="10.10.0.12",
+        limiter=limiter,
+        proxy_policy=policy(),
+        read_timeout_seconds=0.25,
+        replay_guard=replay_guard,
+    )
+
+    assert first.accepted
+    assert not replayed.accepted
+    assert replayed.evidence.reason == "proxy_header_replay"
+    assert replayed.evidence.replay_policy_sha256 == replay_guard.policy.digest
+    assert verify_connection_admission_evidence(replayed.evidence)
+    assert limiter.snapshot().in_flight == 1
+    assert first.release()
+
+
+def test_sqlite_store_failure_rejects_and_releases_capacity(tmp_path) -> None:
+    limiter = ConnectionLimiter(ConnectionLimitPolicy(max_in_flight=1))
+    database = tmp_path / "locked-replay.db"
+    replay_guard = SQLiteReplayGuard(
+        database,
+        SQLiteReplayGuardPolicy(
+            ttl_seconds=30,
+            max_entries=8,
+            namespace="listener-a",
+            busy_timeout_seconds=0.01,
+        ),
+    )
+    blocker = sqlite3.connect(database, isolation_level=None)
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        result = admit_listener_connection(
+            BufferedSocket(build_header(unique_id_value=b"shared-request")),
+            immediate_peer="10.10.0.12",
+            limiter=limiter,
+            proxy_policy=policy(),
+            read_timeout_seconds=0.25,
+            replay_guard=replay_guard,
+        )
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    assert not result.accepted
+    assert result.evidence.reason == "replay_guard_unavailable"
+    assert result.evidence.replay_policy_sha256 == replay_guard.policy.digest
+    assert verify_connection_admission_evidence(result.evidence)
     assert limiter.snapshot().in_flight == 0

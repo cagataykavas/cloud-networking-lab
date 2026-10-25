@@ -24,8 +24,9 @@ from tools.proxy_v2 import (
 )
 from tools.replay_guard import (
     ProxyHeaderReplay,
-    ProxyReplayGuard,
+    ReplayGuard,
     ReplayGuardCapacityExceeded,
+    ReplayGuardUnavailable,
 )
 
 
@@ -90,7 +91,7 @@ def _evidence(
     proxy_evidence_sha256: str | None = None,
     header_bytes: int | None = None,
     address_family: str | None = None,
-    replay_guard: ProxyReplayGuard | None = None,
+    replay_guard: ReplayGuard | None = None,
 ) -> ConnectionAdmissionEvidence:
     listener_state = limiter.snapshot().lifecycle_state
     document = {
@@ -131,7 +132,7 @@ def admit_listener_connection(
     limiter: ConnectionLimiter,
     proxy_policy: ProxyV2Policy,
     read_timeout_seconds: float,
-    replay_guard: ProxyReplayGuard | None = None,
+    replay_guard: ReplayGuard | None = None,
 ) -> ListenerAdmissionResult:
     """Acquire capacity and admit one PROXY v2 connection without queuing.
 
@@ -248,7 +249,11 @@ def admit_listener_connection(
                 )
             try:
                 replay_guard.claim(unique_id_sha256)
-            except (ProxyHeaderReplay, ReplayGuardCapacityExceeded) as exc:
+            except (
+                ProxyHeaderReplay,
+                ReplayGuardCapacityExceeded,
+                ReplayGuardUnavailable,
+            ) as exc:
                 lease.release()
                 return ListenerAdmissionResult(
                     evidence=_evidence(

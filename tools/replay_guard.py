@@ -8,12 +8,32 @@ import re
 import threading
 import time
 from dataclasses import asdict, dataclass
-from typing import Callable
+from typing import Callable, Protocol
 
 
 MAX_REPLAY_TTL_SECONDS = 3_600.0
 MAX_REPLAY_ENTRIES = 1_000_000
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+class ReplayPolicy(Protocol):
+    @property
+    def digest(self) -> str: ...
+
+
+class ReplayGuard(Protocol):
+    policy: ReplayPolicy
+
+    def claim(self, unique_id_sha256: str) -> None: ...
+
+
+class ReplayGuardUnavailable(RuntimeError):
+    """The replay store could not make an atomic admission decision."""
+
+    code = "replay_guard_unavailable"
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
 
 
 class ProxyHeaderReplay(RuntimeError):
