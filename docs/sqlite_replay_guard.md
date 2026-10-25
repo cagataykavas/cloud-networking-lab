@@ -14,6 +14,7 @@ replay_guard = SQLiteReplayGuard(
         max_entries=65_536,
         namespace="public-listener",
         busy_timeout_seconds=1,
+        max_clock_regression_seconds=1,
     ),
 )
 ```
@@ -23,6 +24,13 @@ detection, capacity enforcement, claim insertion and counters therefore commit a
 database uses WAL journaling and full synchronous writes. A lock timeout or SQLite error becomes
 `replay_guard_unavailable`; listener admission catches it and rejects the connection instead of
 bypassing freshness checks.
+
+The store also persists a per-namespace wall-clock watermark. A small rollback within
+`max_clock_regression_seconds` is clamped to the last observed value, so it cannot extend a new
+claim's lifetime. A larger rollback rejects admission with `replay_guard_clock_regression` and
+increments `clock_regression_rejected_total` in the same transaction. The tolerance is part of the
+immutable policy digest. This makes clock rollback visible and fail-closed across every worker that
+shares the database; it is not a replacement for host time synchronization.
 
 Namespaces allow multiple listeners to share one database without sharing identities. The first
 process binds a namespace to the full policy digest, including the SQLite backend, TTL, capacity and
@@ -34,10 +42,12 @@ existing replay window. Policy changes require a deliberate new namespace or sto
 - Put the database in a service-owned directory with restrictive filesystem permissions.
 - All worker processes must use the same database path, namespace and policy.
 - Monitor replay, capacity and unavailable rejections; a full or locked store rejects new traffic.
+- Alert on `clock_regression_rejected_total`; resume admission only after the host clock reaches the
+  stored watermark or an operator deliberately migrates to a new namespace.
 - Do not place the WAL database on NFS or assume it coordinates separate hosts.
 - Back up only if replay counters are operational records; stale claims naturally expire.
 
 This adapter closes the multi-process gap on one host. Fleet-wide admission still requires a shared
 store with an atomic conditional write and TTL semantics, such as a carefully configured Redis or
-DynamoDB adapter. Wall-clock accuracy also bounds TTL behavior; large forward clock jumps can expire
+DynamoDB adapter. The watermark catches backward jumps, but large forward jumps can still expire
 claims early, so production hosts need time synchronization.

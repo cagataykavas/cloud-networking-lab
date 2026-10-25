@@ -507,3 +507,44 @@ def test_sqlite_store_failure_rejects_and_releases_capacity(tmp_path) -> None:
     assert result.evidence.replay_policy_sha256 == replay_guard.policy.digest
     assert verify_connection_admission_evidence(result.evidence)
     assert limiter.snapshot().in_flight == 0
+
+
+def test_sqlite_clock_regression_rejects_and_releases_capacity(tmp_path) -> None:
+    limiter = ConnectionLimiter(ConnectionLimitPolicy(max_in_flight=1))
+    now = [1_000.0]
+    replay_guard = SQLiteReplayGuard(
+        tmp_path / "clock-replay.db",
+        SQLiteReplayGuardPolicy(
+            ttl_seconds=30,
+            max_entries=8,
+            namespace="listener-a",
+            max_clock_regression_seconds=0.5,
+        ),
+        clock=lambda: now[0],
+    )
+    first = admit_listener_connection(
+        BufferedSocket(build_header(unique_id_value=b"request-1")),
+        immediate_peer="10.10.0.12",
+        limiter=limiter,
+        proxy_policy=policy(),
+        read_timeout_seconds=0.25,
+        replay_guard=replay_guard,
+    )
+    assert first.accepted
+    assert first.release()
+
+    now[0] -= 0.501
+    regressed = admit_listener_connection(
+        BufferedSocket(build_header(unique_id_value=b"request-2")),
+        immediate_peer="10.10.0.12",
+        limiter=limiter,
+        proxy_policy=policy(),
+        read_timeout_seconds=0.25,
+        replay_guard=replay_guard,
+    )
+
+    assert not regressed.accepted
+    assert regressed.evidence.reason == "replay_guard_clock_regression"
+    assert regressed.evidence.replay_policy_sha256 == replay_guard.policy.digest
+    assert verify_connection_admission_evidence(regressed.evidence)
+    assert limiter.snapshot().in_flight == 0

@@ -32,7 +32,16 @@ class ReplayGuardUnavailable(RuntimeError):
 
     code = "replay_guard_unavailable"
 
-    def __init__(self) -> None:
+    def __init__(self, *_args: object) -> None:
+        super().__init__(self.code)
+
+
+class ReplayGuardClockRegression(RuntimeError):
+    """The shared store observed an unsafe wall-clock rollback."""
+
+    code = "replay_guard_clock_regression"
+
+    def __init__(self, *_args: object) -> None:
         super().__init__(self.code)
 
 
@@ -41,7 +50,7 @@ class ProxyHeaderReplay(RuntimeError):
 
     code = "proxy_header_replay"
 
-    def __init__(self) -> None:
+    def __init__(self, *_args: object) -> None:
         super().__init__(self.code)
 
 
@@ -50,7 +59,7 @@ class ReplayGuardCapacityExceeded(RuntimeError):
 
     code = "replay_guard_capacity_exceeded"
 
-    def __init__(self) -> None:
+    def __init__(self, *_args: object) -> None:
         super().__init__(self.code)
 
 
@@ -99,6 +108,7 @@ class ReplayGuardSnapshot:
     capacity_rejected_total: int
     expired_total: int
     policy_sha256: str
+    clock_regression_rejected_total: int = 0
 
     def as_dict(self) -> dict[str, int | str]:
         return asdict(self)

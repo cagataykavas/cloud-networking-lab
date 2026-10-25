@@ -26,6 +26,7 @@ from tools.replay_guard import (
     ProxyHeaderReplay,
     ReplayGuard,
     ReplayGuardCapacityExceeded,
+    ReplayGuardClockRegression,
     ReplayGuardUnavailable,
 )
 
@@ -252,6 +253,7 @@ def admit_listener_connection(
             except (
                 ProxyHeaderReplay,
                 ReplayGuardCapacityExceeded,
+                ReplayGuardClockRegression,
                 ReplayGuardUnavailable,
             ) as exc:
                 lease.release()
