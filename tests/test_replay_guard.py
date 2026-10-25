@@ -125,4 +125,5 @@ def test_snapshot_is_low_cardinality_and_policy_bound() -> None:
         "capacity_rejected_total": 0,
         "expired_total": 0,
         "policy_sha256": policy.digest,
+        "clock_regression_rejected_total": 0,
     }
