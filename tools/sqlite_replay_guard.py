@@ -18,21 +18,13 @@ from tools.replay_guard import (
     ProxyHeaderReplay,
     ReplayGuardCapacityExceeded,
     ReplayGuardClockRegression,
+    ReplayGuardPolicyMismatch,
     ReplayGuardSnapshot,
     ReplayGuardUnavailable,
 )
 
 
 NAMESPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-
-
-class ReplayGuardPolicyMismatch(RuntimeError):
-    """A namespace is already bound to a different immutable policy."""
-
-    code = "replay_guard_policy_mismatch"
-
-    def __init__(self) -> None:
-        super().__init__(self.code)
 
 
 @dataclass(frozen=True)

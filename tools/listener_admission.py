@@ -27,6 +27,8 @@ from tools.replay_guard import (
     ReplayGuard,
     ReplayGuardCapacityExceeded,
     ReplayGuardClockRegression,
+    ReplayGuardIntegrityError,
+    ReplayGuardPolicyMismatch,
     ReplayGuardUnavailable,
 )
 
@@ -254,6 +256,8 @@ def admit_listener_connection(
                 ProxyHeaderReplay,
                 ReplayGuardCapacityExceeded,
                 ReplayGuardClockRegression,
+                ReplayGuardIntegrityError,
+                ReplayGuardPolicyMismatch,
                 ReplayGuardUnavailable,
             ) as exc:
                 lease.release()

@@ -45,6 +45,24 @@ class ReplayGuardClockRegression(RuntimeError):
         super().__init__(self.code)
 
 
+class ReplayGuardPolicyMismatch(RuntimeError):
+    """A shared namespace is already bound to a different policy."""
+
+    code = "replay_guard_policy_mismatch"
+
+    def __init__(self, *_args: object) -> None:
+        super().__init__(self.code)
+
+
+class ReplayGuardIntegrityError(RuntimeError):
+    """The shared replay namespace lost one side of its atomic state."""
+
+    code = "replay_guard_integrity_error"
+
+    def __init__(self, *_args: object) -> None:
+        super().__init__(self.code)
+
+
 class ProxyHeaderReplay(RuntimeError):
     """The proxy unique identifier is already live in the replay window."""
 

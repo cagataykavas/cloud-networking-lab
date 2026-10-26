@@ -24,7 +24,12 @@ from tools.proxy_v2 import (
     ProxyV2Policy,
     crc32c,
 )
-from tools.replay_guard import ProxyReplayGuard, ReplayGuardPolicy
+from tools.replay_guard import (
+    ProxyReplayGuard,
+    ReplayGuardIntegrityError,
+    ReplayGuardPolicy,
+    ReplayGuardPolicyMismatch,
+)
 from tools.sqlite_replay_guard import SQLiteReplayGuard, SQLiteReplayGuardPolicy
 
 
@@ -547,4 +552,56 @@ def test_sqlite_clock_regression_rejects_and_releases_capacity(tmp_path) -> None
     assert regressed.evidence.reason == "replay_guard_clock_regression"
     assert regressed.evidence.replay_policy_sha256 == replay_guard.policy.digest
     assert verify_connection_admission_evidence(regressed.evidence)
+    assert limiter.snapshot().in_flight == 0
+
+
+def test_shared_policy_mismatch_rejects_and_releases_capacity() -> None:
+    class MismatchedGuard:
+        policy = ReplayGuardPolicy()
+
+        def claim(self, unique_id_sha256: str) -> None:
+            raise ReplayGuardPolicyMismatch
+
+    limiter = ConnectionLimiter(ConnectionLimitPolicy(max_in_flight=1))
+    replay_guard = MismatchedGuard()
+
+    result = admit_listener_connection(
+        BufferedSocket(build_header(unique_id_value=b"request-1")),
+        immediate_peer="10.10.0.12",
+        limiter=limiter,
+        proxy_policy=policy(),
+        read_timeout_seconds=0.25,
+        replay_guard=replay_guard,
+    )
+
+    assert not result.accepted
+    assert result.evidence.reason == "replay_guard_policy_mismatch"
+    assert result.evidence.replay_policy_sha256 == replay_guard.policy.digest
+    assert verify_connection_admission_evidence(result.evidence)
+    assert limiter.snapshot().in_flight == 0
+
+
+def test_shared_integrity_failure_rejects_and_releases_capacity() -> None:
+    class CorruptedGuard:
+        policy = ReplayGuardPolicy()
+
+        def claim(self, unique_id_sha256: str) -> None:
+            raise ReplayGuardIntegrityError
+
+    limiter = ConnectionLimiter(ConnectionLimitPolicy(max_in_flight=1))
+    replay_guard = CorruptedGuard()
+
+    result = admit_listener_connection(
+        BufferedSocket(build_header(unique_id_value=b"request-1")),
+        immediate_peer="10.10.0.12",
+        limiter=limiter,
+        proxy_policy=policy(),
+        read_timeout_seconds=0.25,
+        replay_guard=replay_guard,
+    )
+
+    assert not result.accepted
+    assert result.evidence.reason == "replay_guard_integrity_error"
+    assert result.evidence.replay_policy_sha256 == replay_guard.policy.digest
+    assert verify_connection_admission_evidence(result.evidence)
     assert limiter.snapshot().in_flight == 0
