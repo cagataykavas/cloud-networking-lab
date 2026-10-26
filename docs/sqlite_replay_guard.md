@@ -47,7 +47,7 @@ existing replay window. Policy changes require a deliberate new namespace or sto
 - Do not place the WAL database on NFS or assume it coordinates separate hosts.
 - Back up only if replay counters are operational records; stale claims naturally expire.
 
-This adapter closes the multi-process gap on one host. Fleet-wide admission still requires a shared
-store with an atomic conditional write and TTL semantics, such as a carefully configured Redis or
-DynamoDB adapter. The watermark catches backward jumps, but large forward jumps can still expire
-claims early, so production hosts need time synchronization.
+This adapter closes the multi-process gap on one host. Use `RedisReplayGuard` when separate hosts
+must share one atomic claim decision; its different replication and failover boundary is documented
+in `docs/redis_replay_guard.md`. The SQLite watermark catches backward jumps, but large forward
+jumps can still expire claims early, so production hosts need time synchronization.
