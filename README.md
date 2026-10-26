@@ -59,8 +59,8 @@ This makes proxy retry/failover behavior visible. The Nginx config uses connecti
 | `docs/proxy_v2_replay_guard.md` | replay threat model, sizing and multi-process boundary |
 | `tools/sqlite_replay_guard.py` | atomic local-worker replay claims with a persistent clock watermark |
 | `docs/sqlite_replay_guard.md` | SQLite transaction, clock rollback and deployment boundaries |
-| `tools/redis_replay_guard.py` | fleet-wide atomic replay claims using server-time Lua decisions |
-| `docs/redis_replay_guard.md` | Redis Cluster slotting, durability and failover boundaries |
+| `tools/redis_replay_guard.py` | fleet-wide atomic replay claims with token-bound ambiguous-result recovery |
+| `docs/redis_replay_guard.md` | Redis Cluster slotting, bounded retries, durability and failover boundaries |
 | `docker-compose.yml` | edge/private network segmentation and service discovery by DNS name |
 
 ## Interview map

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import secrets
 from dataclasses import dataclass
 from typing import Callable, Protocol, Sequence
 
@@ -40,6 +41,7 @@ class RedisReplayGuardPolicy:
     max_entries: int = 65_536
     namespace: str = "default"
     key_prefix: str = "proxy-replay"
+    ambiguous_retry_attempts: int = 1
 
     def __post_init__(self) -> None:
         if (
@@ -59,6 +61,12 @@ class RedisReplayGuardPolicy:
             raise ValueError(
                 f"max_entries must be an integer in [1, {MAX_REPLAY_ENTRIES}]"
             )
+        if (
+            isinstance(self.ambiguous_retry_attempts, bool)
+            or not isinstance(self.ambiguous_retry_attempts, int)
+            or self.ambiguous_retry_attempts not in (0, 1)
+        ):
+            raise ValueError("ambiguous_retry_attempts must be 0 or 1")
         for field_name, value in (
             ("namespace", self.namespace),
             ("key_prefix", self.key_prefix),
@@ -72,7 +80,8 @@ class RedisReplayGuardPolicy:
     @property
     def digest(self) -> str:
         document = {
-            "backend": "redis-v1",
+            "ambiguous_retry_attempts": self.ambiguous_retry_attempts,
+            "backend": "redis-v2",
             "key_prefix": self.key_prefix,
             "max_entries": self.max_entries,
             "namespace": self.namespace,
@@ -91,7 +100,12 @@ local expected_policy = ARGV[1]
 local ttl_ms = tonumber(ARGV[2])
 local max_entries = tonumber(ARGV[3])
 local digest = ARGV[4]
+local operation_token = ARGV[5]
 local marker = 'policy:' .. expected_policy
+
+if string.len(operation_token) ~= 64 or not string.match(operation_token, '^[0-9a-f]+$') then
+    return {'integrity_error'}
+end
 
 local stored_policy = redis.call('HGET', state_key, 'policy_sha256')
 if stored_policy and stored_policy ~= expected_policy then
@@ -116,13 +130,29 @@ end
 
 local server_time = redis.call('TIME')
 local now_ms = (tonumber(server_time[1]) * 1000) + math.floor(tonumber(server_time[2]) / 1000)
-local expired = redis.call('ZREMRANGEBYSCORE', claims_key, '-inf', now_ms)
+local expired_digests = redis.call('ZRANGEBYSCORE', claims_key, '-inf', now_ms)
+local expired = #expired_digests
 if expired > 0 then
+    for _, expired_digest in ipairs(expired_digests) do
+        redis.call('HDEL', state_key, 'claim:' .. expired_digest)
+    end
+    redis.call('ZREMRANGEBYSCORE', claims_key, '-inf', now_ms)
     redis.call('HINCRBY', state_key, 'expired_total', expired)
 end
-if redis.call('ZSCORE', claims_key, digest) then
+local stored_score = redis.call('ZSCORE', claims_key, digest)
+local stored_token = redis.call('HGET', state_key, 'claim:' .. digest)
+if stored_score then
+    if not stored_token or string.len(stored_token) ~= 64 or not string.match(stored_token, '^[0-9a-f]+$') then
+        return {'integrity_error'}
+    end
+    if stored_token == operation_token then
+        return {'accepted_retry'}
+    end
     redis.call('HINCRBY', state_key, 'replay_rejected_total', 1)
     return {'replayed'}
+end
+if stored_token then
+    return {'integrity_error'}
 end
 local active = redis.call('ZCARD', claims_key) - 1
 if active >= max_entries then
@@ -131,6 +161,7 @@ if active >= max_entries then
 end
 
 redis.call('ZADD', claims_key, now_ms + ttl_ms, digest)
+redis.call('HSET', state_key, 'claim:' .. digest, operation_token)
 redis.call('HINCRBY', state_key, 'claimed_total', 1)
 return {'accepted'}
 """
@@ -165,8 +196,13 @@ end
 
 local server_time = redis.call('TIME')
 local now_ms = (tonumber(server_time[1]) * 1000) + math.floor(tonumber(server_time[2]) / 1000)
-local expired = redis.call('ZREMRANGEBYSCORE', claims_key, '-inf', now_ms)
+local expired_digests = redis.call('ZRANGEBYSCORE', claims_key, '-inf', now_ms)
+local expired = #expired_digests
 if expired > 0 then
+    for _, expired_digest in ipairs(expired_digests) do
+        redis.call('HDEL', state_key, 'claim:' .. expired_digest)
+    end
+    redis.call('ZREMRANGEBYSCORE', claims_key, '-inf', now_ms)
     redis.call('HINCRBY', state_key, 'expired_total', expired)
 end
 local counters = redis.call(
@@ -240,26 +276,33 @@ class RedisReplayGuard:
         self,
         script: Callable[..., Sequence[bytes | str | int]],
         *args: str | int,
+        redis_retries: int = 0,
     ) -> Sequence[bytes | str | int]:
-        try:
-            response = script(keys=self._keys, args=args)
-        except RedisError as exc:
-            raise ReplayGuardUnavailable from exc
+        for attempt in range(redis_retries + 1):
+            try:
+                response = script(keys=self._keys, args=args)
+                break
+            except RedisError as exc:
+                if attempt == redis_retries:
+                    raise ReplayGuardUnavailable from exc
         if not isinstance(response, (list, tuple)):
             raise ReplayGuardUnavailable
         return response
 
     def claim(self, unique_id_sha256: str) -> None:
         self._validate_digest(unique_id_sha256)
+        operation_token = secrets.token_hex(32)
         response = self._execute(
             self._claim_script,
             self.policy.digest,
             self.policy.ttl_milliseconds,
             self.policy.max_entries,
             unique_id_sha256,
+            operation_token,
+            redis_retries=self.policy.ambiguous_retry_attempts,
         )
         outcome = self._code(response)
-        if outcome == "accepted":
+        if outcome in ("accepted", "accepted_retry"):
             return
         if outcome == "replayed":
             raise ProxyHeaderReplay
