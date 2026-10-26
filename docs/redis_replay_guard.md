@@ -22,6 +22,7 @@ replay_guard = RedisReplayGuard(
         max_entries=65_536,
         namespace="public-listener",
         key_prefix="payments-edge",
+        ambiguous_retry_attempts=1,
     ),
 )
 ```
@@ -31,9 +32,12 @@ For each claim, the script atomically:
 1. binds the namespace to the immutable backend, TTL, capacity and key policy digest;
 2. reads Redis server time, avoiding divergent listener-host clocks;
 3. removes expired SHA-256 identifiers and accounts for them;
-4. rejects a live duplicate or a full replay window;
-5. verifies a persistent policy marker so partial state/claim-key loss fails closed;
-6. inserts the new digest with its expiry and updates bounded-cardinality counters.
+4. binds a cryptographically random operation token to each accepted identifier;
+5. treats one repeated operation token as the same committed claim, while rejecting a different
+   token for the same identifier as a replay;
+6. rejects a full replay window;
+7. verifies a persistent policy marker and per-claim token so partial state loss fails closed;
+8. inserts the new digest with its expiry and updates bounded-cardinality counters.
 
 The state and sorted-set keys both contain the namespace as a Redis Cluster hash tag, for example
 `payments-edge:{public-listener}:state` and `payments-edge:{public-listener}:claims`. They therefore
@@ -43,8 +47,15 @@ validation rejects braces and other key-shaping input.
 Script, connection, timeout and malformed-response failures become `replay_guard_unavailable`.
 A namespace opened with a different policy becomes `replay_guard_policy_mismatch`. Listener
 admission also rejects `replay_guard_integrity_error` when either half of an initialized namespace
-disappears. These outcomes release the capacity lease without publishing Redis error text or raw
-unique IDs.
+disappears, or when a live claim loses either its sorted-set member or operation token. These
+outcomes release the capacity lease without publishing Redis error text or raw unique IDs.
+
+By default, a claim retries one Redis error with the same random operation token. This closes the
+common ambiguous-result window where Redis committed the Lua transaction but the reply was lost:
+the second execution returns success without incrementing admission counters a second time. A
+different listener invocation creates a different token and remains a replay. Set
+`ambiguous_retry_attempts=0` when the additional bounded socket-timeout interval is unacceptable.
+Malformed responses are never retried, and exhaustion still fails closed.
 
 ## Deployment boundary
 
@@ -59,10 +70,15 @@ unique IDs.
 - Configure `maxmemory-policy noeviction` for guard storage. A policy marker detects loss of only
   one namespace key, but simultaneous deletion of both keys is indistinguishable from first use.
   State and the marker persist after claims expire so policy identity and counters do not reset.
-- Monitor replay, capacity, policy-mismatch and unavailable outcomes. Avoid automatic retries after
-  an unknown script result because the claim may already have committed.
+- Monitor replay, capacity, policy-mismatch and unavailable outcomes. Do not add caller-level claim
+  retries: the adapter owns the single token-bound retry and still reports an unresolved result as
+  unavailable.
+
+The token-bound schema changes the policy digest to `redis-v2`. Existing `redis-v1` namespaces fail
+with `replay_guard_policy_mismatch`; deploy a deliberate new namespace or clear an old namespace
+only after its replay window has safely elapsed.
 
 The integration suite uses two independent clients, concurrent claimers and Redis server time to
-verify exactly-one admission, persisted counters, bounded capacity, expiry and policy-drift
-rejection. It does not simulate primary failover, replication lag, ACL changes or network
-partitions.
+verify exactly-one admission, persisted counters, bounded capacity, expiry, policy-drift rejection
+and a lost reply after a committed transaction. It does not simulate primary failover, replication
+lag, ACL changes or a sustained network partition.
