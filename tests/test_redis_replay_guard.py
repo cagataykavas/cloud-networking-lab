@@ -203,6 +203,31 @@ def test_lost_commit_reply_retries_once_with_the_same_operation_token(
         client.close()
 
 
+def test_required_replica_ack_fails_closed_without_a_replica(redis_url: str) -> None:
+    client = redis.Redis.from_url(redis_url, socket_timeout=1)
+    policy = RedisReplayGuardPolicy(
+        ttl_milliseconds=30_000,
+        max_entries=8,
+        namespace=f"replica-ack-{uuid.uuid4().hex}",
+        required_replica_acks=1,
+        replica_ack_timeout_milliseconds=25,
+    )
+    replay_guard = RedisReplayGuard(client, policy)
+    key = digest("request-without-replica")
+    try:
+        with pytest.raises(ReplayGuardUnavailable, match="replay_guard_unavailable"):
+            replay_guard.claim(key)
+
+        # The primary may have committed even though admission failed closed.
+        # Both attempts used one operation token, so the claim was not counted twice.
+        snapshot = replay_guard.snapshot()
+        assert snapshot.active_entries == 1
+        assert snapshot.claimed_total == 1
+    finally:
+        client.delete(*replay_guard.keys)
+        client.close()
+
+
 def test_namespace_policy_mismatch_fails_closed(
     redis_url: str, guard: RedisReplayGuard
 ) -> None:
@@ -290,6 +315,12 @@ def test_missing_claim_member_with_remaining_token_fails_closed(
         ("ambiguous_retry_attempts", True),
         ("ambiguous_retry_attempts", -1),
         ("ambiguous_retry_attempts", 2),
+        ("required_replica_acks", True),
+        ("required_replica_acks", -1),
+        ("required_replica_acks", 33),
+        ("replica_ack_timeout_milliseconds", True),
+        ("replica_ack_timeout_milliseconds", 0),
+        ("replica_ack_timeout_milliseconds", 5_001),
         ("namespace", "bad namespace"),
         ("namespace", "{slot}"),
         ("key_prefix", "../escape"),
@@ -322,6 +353,8 @@ def test_policy_digest_binds_backend_namespace_and_limits() -> None:
     assert policy.digest != replace(policy, namespace="listener-b").digest
     assert policy.digest != replace(policy, key_prefix="service-b").digest
     assert policy.digest != replace(policy, ambiguous_retry_attempts=0).digest
+    assert policy.digest != replace(policy, required_replica_acks=1).digest
+    assert policy.digest != replace(policy, replica_ack_timeout_milliseconds=101).digest
 
 
 def test_exact_keys_share_one_cluster_hash_slot() -> None:
@@ -359,6 +392,93 @@ class _UnavailableClient:
             raise RedisError("sensitive upstream detail")
 
         return execute
+
+
+class _ReplicaAckPipeline:
+    def __init__(self, client: _ReplicaAckClient) -> None:
+        self.client = client
+        self.response: object = None
+
+    def __enter__(self) -> _ReplicaAckPipeline:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def wait(self, num_replicas: int, timeout: int) -> None:
+        self.client.wait_calls.append((num_replicas, timeout))
+
+    def execute(self) -> list[object]:
+        return [self.response, self.client.replica_acks.pop(0)]
+
+
+class _ReplicaAckClient:
+    def __init__(self, responses: list[object], replica_acks: list[int]) -> None:
+        self.responses = responses
+        self.replica_acks = replica_acks
+        self.claim_attempt_args: list[tuple[object, ...]] = []
+        self.wait_calls: list[tuple[int, int]] = []
+
+    def register_script(self, script: str):
+        is_claim = "local operation_token = ARGV[5]" in script
+
+        def execute(
+            *, keys: object, args: object, client: _ReplicaAckPipeline | None = None
+        ) -> object:
+            assert is_claim
+            assert client is not None
+            self.claim_attempt_args.append(tuple(args))  # type: ignore[arg-type]
+            client.response = self.responses.pop(0)
+            return client
+
+        return execute
+
+    def pipeline(self, transaction: bool = True) -> _ReplicaAckPipeline:
+        assert transaction is False
+        return _ReplicaAckPipeline(self)
+
+
+def test_replica_ack_shortfall_retries_with_same_token() -> None:
+    client = _ReplicaAckClient([[b"accepted"], [b"accepted_retry"]], [0, 1])
+    replay_guard = RedisReplayGuard(
+        client,  # type: ignore[arg-type]
+        RedisReplayGuardPolicy(
+            required_replica_acks=1,
+            replica_ack_timeout_milliseconds=75,
+        ),
+    )
+
+    replay_guard.claim(digest("request-1"))
+
+    assert len(client.claim_attempt_args) == 2
+    assert client.claim_attempt_args[0][-1] == client.claim_attempt_args[1][-1]
+    assert client.wait_calls == [(1, 75), (1, 75)]
+
+
+def test_replica_ack_shortfall_exhaustion_fails_closed() -> None:
+    client = _ReplicaAckClient([[b"accepted"], [b"accepted_retry"]], [0, 0])
+    replay_guard = RedisReplayGuard(
+        client,  # type: ignore[arg-type]
+        RedisReplayGuardPolicy(required_replica_acks=1),
+    )
+
+    with pytest.raises(ReplayGuardUnavailable, match="replay_guard_unavailable"):
+        replay_guard.claim(digest("request-1"))
+
+    assert len(client.claim_attempt_args) == 2
+
+
+def test_replica_ack_is_not_required_to_reject_a_replay() -> None:
+    client = _ReplicaAckClient([[b"replayed"]], [0])
+    replay_guard = RedisReplayGuard(
+        client,  # type: ignore[arg-type]
+        RedisReplayGuardPolicy(required_replica_acks=1),
+    )
+
+    with pytest.raises(ProxyHeaderReplay, match="proxy_header_replay"):
+        replay_guard.claim(digest("request-1"))
+
+    assert len(client.claim_attempt_args) == 1
 
 
 @pytest.mark.parametrize("response", [None, [], [b"unknown"], [b"\xff"]])
