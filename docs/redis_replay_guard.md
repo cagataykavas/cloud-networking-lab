@@ -23,6 +23,8 @@ replay_guard = RedisReplayGuard(
         namespace="public-listener",
         key_prefix="payments-edge",
         ambiguous_retry_attempts=1,
+        required_replica_acks=1,
+        replica_ack_timeout_milliseconds=100,
     ),
 )
 ```
@@ -57,6 +59,16 @@ different listener invocation creates a different token and remains a replay. Se
 `ambiguous_retry_attempts=0` when the additional bounded socket-timeout interval is unacceptable.
 Malformed responses are never retried, and exhaustion still fails closed.
 
+Set `required_replica_acks` above zero to make a newly accepted claim wait for that many replicas
+before listener admission succeeds. The adapter queues the Lua claim and `WAIT` in a
+non-transactional pipeline, which pins both commands to one pooled connection; this matters because
+`WAIT` observes the calling connection's last write offset. An acknowledgement shortfall is an
+ambiguous durability result, so the one bounded retry reuses the same operation token. If the
+shortfall persists, admission fails as `replay_guard_unavailable`. Replays and other negative
+decisions remain negative even if their counter updates have not reached the requested replica
+count. Leave the default `required_replica_acks=0` when the deployment has no replicas or when the
+extra latency is outside the listener budget.
+
 ## Deployment boundary
 
 - Use TLS, Redis ACLs and a service identity limited to the guard's exact key prefix and commands.
@@ -64,9 +76,10 @@ Malformed responses are never retried, and exhaustion still fails closed.
   connection-pool or retry policy.
 - Keep one authoritative primary for a namespace. Redis server time removes host-clock drift but
   does not protect against a bad Redis clock.
-- Treat asynchronous failover as a replay-risk decision: an acknowledged claim can be lost before
-  replication. Use a persistence/replication policy whose loss window matches the threat model, or
-  choose a strongly consistent conditional-write store.
+- `WAIT` reduces the acknowledged replication-loss window; it does not make Redis failover
+  linearizable, guarantee replica persistence, or prevent a promoted stale replica. Pair it with a
+  tested failover/persistence policy whose loss window matches the threat model, or choose a
+  strongly consistent conditional-write store.
 - Configure `maxmemory-policy noeviction` for guard storage. A policy marker detects loss of only
   one namespace key, but simultaneous deletion of both keys is indistinguishable from first use.
   State and the marker persist after claims expire so policy identity and counters do not reset.
@@ -74,11 +87,12 @@ Malformed responses are never retried, and exhaustion still fails closed.
   retries: the adapter owns the single token-bound retry and still reports an unresolved result as
   unavailable.
 
-The token-bound schema changes the policy digest to `redis-v2`. Existing `redis-v1` namespaces fail
-with `replay_guard_policy_mismatch`; deploy a deliberate new namespace or clear an old namespace
-only after its replay window has safely elapsed.
+Replica acknowledgement settings change the policy digest to `redis-v3`. Existing `redis-v1` and
+`redis-v2` namespaces fail with `replay_guard_policy_mismatch`; deploy a deliberate new namespace
+or clear an old namespace only after its replay window has safely elapsed.
 
 The integration suite uses two independent clients, concurrent claimers and Redis server time to
 verify exactly-one admission, persisted counters, bounded capacity, expiry, policy-drift rejection
-and a lost reply after a committed transaction. It does not simulate primary failover, replication
-lag, ACL changes or a sustained network partition.
+and a lost reply after a committed transaction. It also verifies that a real primary with no
+replica fails closed when one acknowledgement is required. It does not yet simulate primary
+promotion, controlled replication lag, ACL changes or a sustained network partition.

@@ -5,6 +5,7 @@ import json
 import re
 import secrets
 from dataclasses import dataclass
+from types import TracebackType
 from typing import Callable, Protocol, Sequence
 
 from redis.exceptions import RedisError
@@ -23,16 +24,39 @@ from tools.replay_guard import (
 
 NAMESPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 MAX_REPLAY_TTL_MILLISECONDS = 3_600_000
+MAX_REPLICA_ACKNOWLEDGEMENTS = 32
+MAX_REPLICA_ACK_TIMEOUT_MILLISECONDS = 5_000
+
+
+class RedisPipeline(Protocol):
+    def __enter__(self) -> RedisPipeline: ...
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool | None: ...
+
+    def wait(self, num_replicas: int, timeout: int) -> object: ...
+
+    def execute(self) -> list[object]: ...
 
 
 class RedisScript(Protocol):
     def __call__(
-        self, *, keys: Sequence[str], args: Sequence[str | int]
+        self,
+        *,
+        keys: Sequence[str],
+        args: Sequence[str | int],
+        client: RedisPipeline | None = None,
     ) -> Sequence[bytes | str | int]: ...
 
 
 class RedisClient(Protocol):
     def register_script(self, script: str) -> RedisScript: ...
+
+    def pipeline(self, transaction: bool = True) -> RedisPipeline: ...
 
 
 @dataclass(frozen=True)
@@ -42,6 +66,8 @@ class RedisReplayGuardPolicy:
     namespace: str = "default"
     key_prefix: str = "proxy-replay"
     ambiguous_retry_attempts: int = 1
+    required_replica_acks: int = 0
+    replica_ack_timeout_milliseconds: int = 100
 
     def __post_init__(self) -> None:
         if (
@@ -67,6 +93,26 @@ class RedisReplayGuardPolicy:
             or self.ambiguous_retry_attempts not in (0, 1)
         ):
             raise ValueError("ambiguous_retry_attempts must be 0 or 1")
+        if (
+            isinstance(self.required_replica_acks, bool)
+            or not isinstance(self.required_replica_acks, int)
+            or not 0 <= self.required_replica_acks <= MAX_REPLICA_ACKNOWLEDGEMENTS
+        ):
+            raise ValueError(
+                "required_replica_acks must be an integer in "
+                f"[0, {MAX_REPLICA_ACKNOWLEDGEMENTS}]"
+            )
+        if (
+            isinstance(self.replica_ack_timeout_milliseconds, bool)
+            or not isinstance(self.replica_ack_timeout_milliseconds, int)
+            or not 1
+            <= self.replica_ack_timeout_milliseconds
+            <= MAX_REPLICA_ACK_TIMEOUT_MILLISECONDS
+        ):
+            raise ValueError(
+                "replica_ack_timeout_milliseconds must be an integer in "
+                f"[1, {MAX_REPLICA_ACK_TIMEOUT_MILLISECONDS}]"
+            )
         for field_name, value in (
             ("namespace", self.namespace),
             ("key_prefix", self.key_prefix),
@@ -81,10 +127,12 @@ class RedisReplayGuardPolicy:
     def digest(self) -> str:
         document = {
             "ambiguous_retry_attempts": self.ambiguous_retry_attempts,
-            "backend": "redis-v2",
+            "backend": "redis-v3",
             "key_prefix": self.key_prefix,
             "max_entries": self.max_entries,
             "namespace": self.namespace,
+            "replica_ack_timeout_milliseconds": (self.replica_ack_timeout_milliseconds),
+            "required_replica_acks": self.required_replica_acks,
             "ttl_milliseconds": self.ttl_milliseconds,
         }
         encoded = json.dumps(document, sort_keys=True, separators=(",", ":")).encode(
@@ -242,6 +290,7 @@ class RedisReplayGuard:
             f"{self.policy.key_prefix}:{slot}:state",
             f"{self.policy.key_prefix}:{slot}:claims",
         )
+        self._client = client
         self._claim_script = client.register_script(_CLAIM_SCRIPT)
         self._snapshot_script = client.register_script(_SNAPSHOT_SCRIPT)
 
@@ -289,18 +338,68 @@ class RedisReplayGuard:
             raise ReplayGuardUnavailable
         return response
 
+    def _execute_durable_claim(
+        self,
+        *args: str | int,
+    ) -> Sequence[bytes | str | int]:
+        """Run the claim and WAIT on one pooled connection.
+
+        Redis WAIT uses the calling connection's last write offset. A
+        non-transactional pipeline pins both commands to the same connection
+        without attempting to block from inside Lua or MULTI.
+        """
+        retries = self.policy.ambiguous_retry_attempts
+        for attempt in range(retries + 1):
+            try:
+                with self._client.pipeline(transaction=False) as pipeline:
+                    self._claim_script(keys=self._keys, args=args, client=pipeline)
+                    pipeline.wait(
+                        self.policy.required_replica_acks,
+                        self.policy.replica_ack_timeout_milliseconds,
+                    )
+                    results = pipeline.execute()
+            except RedisError as exc:
+                if attempt == retries:
+                    raise ReplayGuardUnavailable from exc
+                continue
+
+            if not isinstance(results, (list, tuple)) or len(results) != 2:
+                raise ReplayGuardUnavailable
+            response = results[0]
+            if not isinstance(response, (list, tuple)):
+                raise ReplayGuardUnavailable
+            outcome = self._code(response)
+            if outcome not in ("accepted", "accepted_retry"):
+                return response
+            replica_acks = results[1]
+            if (
+                not isinstance(replica_acks, bool)
+                and isinstance(replica_acks, int)
+                and replica_acks >= self.policy.required_replica_acks
+            ):
+                return response
+            if attempt == retries:
+                raise ReplayGuardUnavailable
+        raise ReplayGuardUnavailable
+
     def claim(self, unique_id_sha256: str) -> None:
         self._validate_digest(unique_id_sha256)
         operation_token = secrets.token_hex(32)
-        response = self._execute(
-            self._claim_script,
+        args = (
             self.policy.digest,
             self.policy.ttl_milliseconds,
             self.policy.max_entries,
             unique_id_sha256,
             operation_token,
-            redis_retries=self.policy.ambiguous_retry_attempts,
         )
+        if self.policy.required_replica_acks:
+            response = self._execute_durable_claim(*args)
+        else:
+            response = self._execute(
+                self._claim_script,
+                *args,
+                redis_retries=self.policy.ambiguous_retry_attempts,
+            )
         outcome = self._code(response)
         if outcome in ("accepted", "accepted_retry"):
             return
