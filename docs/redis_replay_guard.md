@@ -94,5 +94,35 @@ or clear an old namespace only after its replay window has safely elapsed.
 The integration suite uses two independent clients, concurrent claimers and Redis server time to
 verify exactly-one admission, persisted counters, bounded capacity, expiry, policy-drift rejection
 and a lost reply after a committed transaction. It also verifies that a real primary with no
-replica fails closed when one acknowledgement is required. It does not yet simulate primary
-promotion, controlled replication lag, ACL changes or a sustained network partition.
+replica fails closed when one acknowledgement is required.
+
+## Reproducible stale-promotion drill
+
+The opt-in Compose profile runs a separate, ephemeral primary/replica pair on loopback ports 16379
+and 16380. The drill first proves the replica is synchronized, redirects replication to a closed
+loopback port, and then creates two claims on the isolated primary. The ungated claim is admitted;
+the replica-gated claim is committed locally but admission is denied because `WAIT` receives no
+acknowledgement. The drill shuts down the primary without persistence, promotes the stale replica,
+and verifies that the same ungated digest can be admitted again while the replica-gated policy still
+denies admission without an acknowledgement.
+
+```bash
+docker compose --profile redis-failover up -d --wait redis_fault_primary redis_fault_replica
+python -m tools.redis_failover_drill \
+  --primary-url redis://127.0.0.1:16379/0 \
+  --replica-url redis://127.0.0.1:16380/0 \
+  --receipt /tmp/redis-failover-receipt.json
+docker compose --profile redis-failover down --volumes
+```
+
+The harness refuses non-loopback endpoints, embedded credentials, endpoint reuse and unbounded
+timeouts before issuing `REPLICAOF` or `SHUTDOWN`. Its JSON receipt records only policy outcomes and
+replication offsets—never claim digests, operation tokens or Redis URLs. CI executes the live drill
+and retains the receipt artifact for 14 days; unit tests cover its safety boundary and private atomic
+receipt writer.
+
+This deliberately demonstrates a limitation rather than claiming linearizability: `WAIT` protects
+admission when the requested replica acknowledgement is unavailable, but it cannot select the
+freshest replica or prevent an operator from promoting stale state. Production failover therefore
+still requires freshness-aware orchestration or a strongly consistent conditional-write store. The
+drill does not model Sentinel/Cluster elections, disk persistence, ACL rotation or network healing.
