@@ -40,6 +40,37 @@ services:
       private_app:
         ipv4_address: 172.29.0.12
 
+  redis_fault_primary:
+    image: redis:8.2.10-alpine
+    profiles: ["redis-failover"]
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--protected-mode", "no"]
+    ports:
+      - "127.0.0.1:16379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 1s
+      retries: 20
+    networks:
+      - redis_fault_lab
+
+  redis_fault_replica:
+    image: redis:8.2.10-alpine
+    profiles: ["redis-failover"]
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--protected-mode", "no", "--replicaof", "redis_fault_primary", "6379"]
+    ports:
+      - "127.0.0.1:16380:6379"
+    depends_on:
+      redis_fault_primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 1s
+      retries: 20
+    networks:
+      - redis_fault_lab
+
 networks:
   edge:
     driver: bridge
@@ -52,3 +83,5 @@ networks:
     ipam:
       config:
         - subnet: 172.29.0.0/24
+  redis_fault_lab:
+    driver: bridge

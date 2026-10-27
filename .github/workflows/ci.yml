@@ -29,4 +29,24 @@ jobs:
       - run: ruff check app tools tests 01_cidr.py 02_tcp_echo.py
       - run: python -m pytest -q
       - run: docker compose config
+      - name: Start isolated Redis failover pair
+        run: docker compose --profile redis-failover up -d --wait redis_fault_primary redis_fault_replica
+      - name: Exercise stale-replica promotion boundary
+        id: failover_drill
+        run: >-
+          python -m tools.redis_failover_drill
+          --primary-url redis://127.0.0.1:16379/0
+          --replica-url redis://127.0.0.1:16380/0
+          --receipt "${RUNNER_TEMP}/redis-failover-receipt.json"
+      - name: Archive failover evidence
+        if: ${{ always() && (steps.failover_drill.outcome == 'success' || steps.failover_drill.outcome == 'failure') }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: redis-failover-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/redis-failover-receipt.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Stop isolated Redis failover pair
+        if: always()
+        run: docker compose --profile redis-failover down --volumes
       - run: docker build -t cloud-networking-lab:test .
