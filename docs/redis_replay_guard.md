@@ -145,6 +145,51 @@ lease. A compromised shared HMAC key can authorize a stale candidate, an incorre
 remains incorrect after signing, and any replay-serving path that bypasses the wrapper remains
 unsafe. The verifier deliberately does not persist epochs or discover failover topology.
 
+### Durable authority ledger
+
+`SQLitePromotionAuthority` persists the election decision that feeds the proof signer. Each row
+binds the cluster, monotonic authority epoch, selected candidate, minimum replication offset,
+replication-ID commitment and observation time into a SHA-256 chain. Revisions are append-only,
+written under `BEGIN IMMEDIATE`, revalidated on every operation and protected by no-update/no-delete
+triggers. The database is created with mode `0600`; secrets and raw replication IDs are never stored.
+
+```python
+from tools.redis_promotion_authority import SQLitePromotionAuthority
+
+authority = SQLitePromotionAuthority("/var/lib/replay/authority.db", "edge-replay")
+previous = authority.snapshot()
+state = authority.advance(
+    authority_epoch=43,
+    candidate_id="redis-b",
+    minimum_replication_offset=required_offset,
+    snapshot=promoted_snapshot,
+    observed_at=trusted_unix_time,
+    expected_state_sha256=previous.state_sha256 if previous else None,
+)
+proof = authority.issue_proof(
+    expected_state_sha256=state.state_sha256,
+    candidate_id="redis-b",
+    snapshot=current_snapshot,
+    issued_at=trusted_unix_time,
+    expires_at=trusted_unix_time + 30,
+    key_id="rotation-8",
+    secret=promotion_hmac_key,
+)
+```
+
+Persist the returned `state_sha256` in the failover controller's own rollback-protected checkpoint
+and require it on the next update and every proof issuance. This compare-and-swap token rejects stale
+concurrent writers and detects a database restored behind that external checkpoint. Exact retries are
+idempotent; reused epochs, decreasing offset floors, regressing observation times, candidate/role/
+replication-ID drift and SQLite lock failures all fail closed.
+
+The ledger is deliberately a single-host coordination primitive, not Sentinel/Cluster discovery,
+leader election, distributed consensus or Byzantine tamper resistance. Rolling back both the SQLite
+file and the external head checkpoint remains undetectable, and an administrator with database write
+access can rewrite and rehash the complete chain. Put the database on durable local storage with a
+trusted parent directory, retain the external head in a stronger control plane, and keep proof keys in
+a secret manager rather than alongside the database.
+
 ## Reproducible stale-promotion drill
 
 The opt-in Compose profile runs a separate, ephemeral primary/replica pair on loopback ports 16379
