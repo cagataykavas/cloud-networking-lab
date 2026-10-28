@@ -96,6 +96,55 @@ verify exactly-one admission, persisted counters, bounded capacity, expiry, poli
 and a lost reply after a committed transaction. It also verifies that a real primary with no
 replica fails closed when one acknowledgement is required.
 
+## Promotion freshness proof
+
+`WAIT` cannot decide whether a failover candidate contains the minimum state required by an
+external promotion authority. Gate every replay-serving entry point with
+`execute_after_promotion_proof` before invoking `RedisReplayGuard.claim` on a promoted node:
+
+```python
+from tools.redis_promotion_proof import (
+    RedisPromotionPolicy,
+    RedisReplicationSnapshot,
+    execute_after_promotion_proof,
+    load_promotion_proof_json,
+)
+
+snapshot = RedisReplicationSnapshot.from_info(redis_client.info("replication"))
+proof = load_promotion_proof_json(received_text)
+policy = RedisPromotionPolicy(
+    cluster_id="edge-replay",
+    candidate_id="redis-b",
+    minimum_authority_epoch=42,
+    keyring={"rotation-7": promotion_hmac_key},
+)
+authorization, result = execute_after_promotion_proof(
+    proof,
+    policy,
+    snapshot,
+    now=trusted_unix_time,
+    operation=lambda: replay_guard.claim(unique_id_sha256),
+)
+```
+
+The HMAC-SHA256 proof has a strict schema and binds the cluster, candidate, authority epoch,
+authority-required minimum offset, candidate-observed offset, SHA-256 commitment to the replication
+ID, issue/expiry times and key ID. Verification uses constant-time signature comparison and then
+fails closed on an unknown key, scope mismatch, stale epoch, invalid lifetime, future/expired proof,
+candidate below the signed offset floor, non-promoted role, replication-ID change or offset
+regression. The callback is invoked only after all checks pass.
+
+Keep `minimum_authority_epoch` in a durable, rollback-protected control plane and issue proofs only
+after the failover controller has selected a candidate and established the required offset. Load the
+keyring from a secret manager, overlap keys during rotation and remove retired key IDs after the
+maximum proof lifetime. Proof digests and replication-ID commitments are suitable for low-cardinality
+evidence; raw replication IDs and HMAC material are not.
+
+This is authenticated orchestration evidence, not consensus, remote attestation or a distributed
+lease. A compromised shared HMAC key can authorize a stale candidate, an incorrect minimum offset
+remains incorrect after signing, and any replay-serving path that bypasses the wrapper remains
+unsafe. The verifier deliberately does not persist epochs or discover failover topology.
+
 ## Reproducible stale-promotion drill
 
 The opt-in Compose profile runs a separate, ephemeral primary/replica pair on loopback ports 16379
@@ -104,7 +153,9 @@ loopback port, and then creates two claims on the isolated primary. The ungated 
 the replica-gated claim is committed locally but admission is denied because `WAIT` receives no
 acknowledgement. The drill shuts down the primary without persistence, promotes the stale replica,
 and verifies that the same ungated digest can be admitted again while the replica-gated policy still
-denies admission without an acknowledgement.
+denies admission without an acknowledgement. It also creates an ephemeral signed promotion proof
+whose required minimum is the detached primary's final offset. The stale promoted candidate is below
+that floor, so the proof gate rejects it before the replay claim callback can run.
 
 ```bash
 docker compose --profile redis-failover up -d --wait redis_fault_primary redis_fault_replica
@@ -116,13 +167,16 @@ docker compose --profile redis-failover down --volumes
 ```
 
 The harness refuses non-loopback endpoints, embedded credentials, endpoint reuse and unbounded
-timeouts before issuing `REPLICAOF` or `SHUTDOWN`. Its JSON receipt records only policy outcomes and
-replication offsets—never claim digests, operation tokens or Redis URLs. CI executes the live drill
-and retains the receipt artifact for 14 days; unit tests cover its safety boundary and private atomic
-receipt writer.
+timeouts before issuing `REPLICAOF` or `SHUTDOWN`. Its schema-v2 JSON receipt records policy outcomes,
+replication offsets, the authority epoch, rejection reason and promotion-proof SHA-256—never claim
+digests, HMAC keys, signatures, raw replication IDs, operation tokens or Redis URLs. CI executes the
+live drill and retains the receipt artifact for 14 days; unit tests cover its safety boundary,
+promotion verifier and private atomic receipt writer.
 
 This deliberately demonstrates a limitation rather than claiming linearizability: `WAIT` protects
 admission when the requested replica acknowledgement is unavailable, but it cannot select the
 freshest replica or prevent an operator from promoting stale state. Production failover therefore
 still requires freshness-aware orchestration or a strongly consistent conditional-write store. The
-drill does not model Sentinel/Cluster elections, disk persistence, ACL rotation or network healing.
+drill's signing key and epoch are ephemeral test inputs; production must source both from a durable
+authority. The drill does not model Sentinel/Cluster elections, disk persistence, ACL rotation or
+network healing.
