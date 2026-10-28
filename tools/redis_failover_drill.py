@@ -8,6 +8,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import secrets
 import tempfile
 import time
 import uuid
@@ -19,6 +20,14 @@ from urllib.parse import urlsplit
 import redis
 from redis.exceptions import RedisError
 
+from tools.redis_promotion_proof import (
+    PromotionProofRejected,
+    RedisPromotionPolicy,
+    RedisPromotionProof,
+    RedisReplicationSnapshot,
+    execute_after_promotion_proof,
+    sign_promotion_proof,
+)
 from tools.redis_replay_guard import RedisReplayGuard, RedisReplayGuardPolicy
 from tools.replay_guard import ReplayGuardUnavailable
 
@@ -78,6 +87,7 @@ def run_drill(
     marker_key = f"redis-failover-drill:{run_id}:sync"
     ungated_key = _digest(f"{run_id}:ungated")
     gated_key = _digest(f"{run_id}:gated")
+    proof_gated_key = _digest(f"{run_id}:proof-gated")
     ungated_policy = RedisReplayGuardPolicy(
         namespace=f"drill-{run_id}-ungated",
         required_replica_acks=0,
@@ -150,9 +160,48 @@ def run_drill(
             timeout_seconds,
             "stale replica was not promoted",
         )
-        promoted_before = _integer_field(
-            replica.info("replication"), "master_repl_offset"
+        promoted_snapshot = RedisReplicationSnapshot.from_info(
+            replica.info("replication")
         )
+        promoted_before = promoted_snapshot.offset
+
+        authority_epoch = 1
+        proof_secret = secrets.token_bytes(32)
+        proof_issued_at = int(time.time())
+        promotion_proof = sign_promotion_proof(
+            cluster_id="redis-failover-drill",
+            candidate_id="redis-fault-replica",
+            authority_epoch=authority_epoch,
+            minimum_replication_offset=primary_after,
+            snapshot=promoted_snapshot,
+            issued_at=proof_issued_at,
+            expires_at=proof_issued_at + 30,
+            key_id="drill-ephemeral",
+            secret=proof_secret,
+        )
+        promotion_policy = RedisPromotionPolicy(
+            cluster_id="redis-failover-drill",
+            candidate_id="redis-fault-replica",
+            minimum_authority_epoch=authority_epoch,
+            keyring={"drill-ephemeral": proof_secret},
+            max_proof_lifetime_seconds=30,
+        )
+        proof_gate_reason = _expect_promotion_denied(
+            promotion_proof,
+            promotion_policy,
+            promoted_snapshot,
+            now=proof_issued_at,
+            operation=lambda: RedisReplayGuard(replica, ungated_policy).claim(
+                proof_gated_key
+            ),
+        )
+        if replica.hexists(
+            RedisReplayGuard(replica, ungated_policy).keys[0],
+            f"claim:{proof_gated_key}",
+        ):
+            raise RuntimeError(
+                "proof-gated replay operation ran after promotion denial"
+            )
 
         # The same digest is accepted again because the promoted node never saw
         # the primary-only claim. This is the documented asynchronous boundary.
@@ -162,7 +211,7 @@ def run_drill(
         )
         return {
             "status": "pass",
-            "schema_version": 1,
+            "schema_version": 2,
             "run_id": run_id,
             "scenario": "controlled-stale-replica-promotion",
             "observed": {
@@ -170,6 +219,11 @@ def run_drill(
                 "gated_promoted_replica": gated_promoted,
                 "primary_offset_after_detached_claims": primary_after,
                 "promoted_offset_before_reclaims": promoted_before,
+                "promotion_authority_epoch": authority_epoch,
+                "promotion_proof_decision": "admission_denied",
+                "promotion_proof_reason": proof_gate_reason,
+                "promotion_proof_sha256": promotion_proof.digest,
+                "required_minimum_replication_offset": primary_after,
                 "replica_offset_before_disconnect": replica_before,
                 "ungated_primary": "accepted",
                 "ungated_promoted_replica": "accepted_again",
@@ -177,6 +231,7 @@ def run_drill(
             "boundary": {
                 "replica_ack_gate_kept_admission_closed": True,
                 "stale_promotion_reopened_ungated_claim": True,
+                "stale_promotion_proof_denied_replay_traffic": True,
             },
         }
     finally:
@@ -216,6 +271,31 @@ def _expect_unavailable(operation: Callable[[], None]) -> str:
     except ReplayGuardUnavailable:
         return "admission_denied"
     raise RuntimeError("replica-gated claim unexpectedly admitted traffic")
+
+
+def _expect_promotion_denied(
+    proof: RedisPromotionProof,
+    policy: RedisPromotionPolicy,
+    snapshot: RedisReplicationSnapshot,
+    *,
+    now: int,
+    operation: Callable[[], None],
+) -> str:
+    try:
+        execute_after_promotion_proof(
+            proof,
+            policy,
+            snapshot,
+            now=now,
+            operation=operation,
+        )
+    except PromotionProofRejected as exc:
+        if exc.reason != "replication_offset_below_minimum":
+            raise RuntimeError(
+                f"promotion proof failed for unexpected reason: {exc.reason}"
+            ) from exc
+        return exc.reason
+    raise RuntimeError("stale candidate unexpectedly satisfied the promotion proof")
 
 
 def _is_synced_replica(primary: redis.Redis, replica: redis.Redis) -> bool:
