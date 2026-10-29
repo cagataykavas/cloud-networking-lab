@@ -225,3 +225,58 @@ still requires freshness-aware orchestration or a strongly consistent conditiona
 drill's signing key and epoch are ephemeral test inputs; production must source both from a durable
 authority. The drill does not model Sentinel/Cluster elections, disk persistence, ACL rotation or
 network healing.
+
+## Sentinel election adapter
+
+`tools/redis_sentinel_promotion.py` turns a live `SENTINEL MASTER` response and
+the selected candidate's `INFO replication` document into a validated authority-ledger
+decision. The adapter binds the configured master name and endpoint to Sentinel's 40-hex
+run ID, requires a monotonic configuration epoch, rejects subjective/objective-down,
+disconnected and in-progress failover states, bounds Sentinel INFO and ping age, and
+checks that enough Sentinels are visible to satisfy the configured quorum. It also
+requires the candidate to report `role=master` at or above an externally retained
+replication-offset floor.
+
+```python
+from redis import Redis
+
+from tools.redis_promotion_authority import SQLitePromotionAuthority
+from tools.redis_sentinel_promotion import (
+    SentinelPromotionPolicy,
+    observe_sentinel_promotion,
+)
+
+sentinel = Redis(host="sentinel-a", port=26379, decode_responses=False)
+candidate = Redis(host="10.0.0.12", port=6379, decode_responses=True)
+policy = SentinelPromotionPolicy(
+    master_name="replay-primary",
+    candidate_host="10.0.0.12",
+    candidate_port=6379,
+    minimum_config_epoch=42,
+)
+decision = observe_sentinel_promotion(
+    sentinel,
+    candidate,
+    policy,
+    minimum_replication_offset=durable_pre_failover_offset,
+    observed_at=trusted_unix_time,
+)
+state = decision.advance(
+    SQLitePromotionAuthority("/var/lib/replay/authority.db", "edge-replay"),
+    expected_state_sha256=externally_anchored_head,
+)
+```
+
+The returned `source_sha256` commits to privacy-reduced topology evidence without
+including the raw replication ID or endpoint. Persist it with controller audit evidence;
+the current ledger schema intentionally stores only the fields required to issue a
+promotion proof.
+
+Sentinel's quorum field and visible-Sentinel count do **not** prove that a quorum voted
+for a particular leader, and Sentinel does not expose a safe replication-offset floor.
+The caller must retain that floor before failover, use a trusted clock, connect to the
+configured endpoints over an authenticated network, and anchor the ledger head in a
+stronger control-plane store. The adapter does not initiate failover, discover arbitrary
+endpoints, fence an old primary, implement consensus, or make Redis Sentinel Byzantine
+fault tolerant.
+
