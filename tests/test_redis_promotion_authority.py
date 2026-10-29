@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import shutil
 from pathlib import Path
@@ -45,12 +47,14 @@ def advance(
     current: RedisReplicationSnapshot | None = None,
     observed_at: int = NOW,
     expected: str | None = None,
+    source_sha256: str | None = None,
 ):
     return ledger.advance(
         authority_epoch=epoch,
         candidate_id=candidate,
         minimum_replication_offset=minimum_offset,
         snapshot=current or snapshot(),
+        source_sha256=source_sha256,
         observed_at=observed_at,
         expected_state_sha256=expected,
     )
@@ -158,6 +162,36 @@ def test_exact_advance_retry_is_idempotent(tmp_path: Path) -> None:
         assert connection.execute(
             "SELECT COUNT(*) FROM promotion_authority_revisions"
         ).fetchone() == (1,)
+
+
+def test_source_commitment_is_hash_bound_and_idempotent(tmp_path: Path) -> None:
+    ledger = authority(tmp_path)
+    source = "b" * 64
+    first = advance(ledger, source_sha256=source)
+
+    retried = advance(
+        ledger,
+        expected=first.state_sha256,
+        source_sha256=source,
+    )
+
+    assert retried == first
+    assert first.schema_version == 2
+    assert first.source_sha256 == source
+    assert first.payload()["source_sha256"] == source
+
+
+def test_version_two_chain_cannot_drop_source_commitment(tmp_path: Path) -> None:
+    ledger = authority(tmp_path)
+    first = advance(ledger, source_sha256="b" * 64)
+
+    with pytest.raises(PromotionAuthorityConflict, match="source_required"):
+        advance(
+            ledger,
+            epoch=8,
+            observed_at=NOW + 1,
+            expected=first.state_sha256,
+        )
 
 
 def test_stale_writer_cannot_append_or_issue_proof(tmp_path: Path) -> None:
@@ -314,6 +348,116 @@ def test_reopen_detects_hash_chain_tampering(tmp_path: Path) -> None:
 
     with pytest.raises(PromotionAuthorityCorrupt, match="digest_mismatch"):
         SQLitePromotionAuthority(database, "edge-replay")
+
+
+def test_reopen_detects_source_commitment_tampering(tmp_path: Path) -> None:
+    database = tmp_path / "authority.db"
+    ledger = SQLitePromotionAuthority(database, "edge-replay")
+    state = advance(ledger, source_sha256="b" * 64)
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TRIGGER promotion_authority_no_update")
+        connection.execute(
+            """
+            UPDATE promotion_authority_revisions
+            SET source_sha256 = ?
+            WHERE state_sha256 = ?
+            """,
+            ("c" * 64, state.state_sha256),
+        )
+
+    with pytest.raises(PromotionAuthorityCorrupt, match="digest_mismatch"):
+        SQLitePromotionAuthority(database, "edge-replay")
+
+
+def test_migrates_legacy_schema_before_binding_source(tmp_path: Path) -> None:
+    database = tmp_path / "legacy-authority.db"
+    legacy_payload = {
+        "authority_epoch": 7,
+        "candidate_id": "redis-b",
+        "cluster_id": "edge-replay",
+        "minimum_replication_offset": 100,
+        "observed_at": NOW,
+        "previous_state_sha256": None,
+        "replid_sha256": snapshot().replid_sha256,
+        "revision": 1,
+        "schema_version": 1,
+    }
+    legacy_digest = hashlib.sha256(
+        json.dumps(
+            legacy_payload,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    ).hexdigest()
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TABLE promotion_authority_revisions (
+                cluster_id TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision > 0),
+                authority_epoch INTEGER NOT NULL CHECK (authority_epoch >= 0),
+                candidate_id TEXT NOT NULL,
+                minimum_replication_offset INTEGER NOT NULL
+                    CHECK (minimum_replication_offset >= 0),
+                replid_sha256 TEXT NOT NULL,
+                observed_at INTEGER NOT NULL CHECK (observed_at >= 0),
+                previous_state_sha256 TEXT,
+                state_sha256 TEXT NOT NULL,
+                PRIMARY KEY (cluster_id, revision),
+                UNIQUE (cluster_id, authority_epoch),
+                UNIQUE (cluster_id, state_sha256)
+            ) WITHOUT ROWID
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO promotion_authority_revisions (
+                cluster_id, revision, authority_epoch, candidate_id,
+                minimum_replication_offset, replid_sha256, observed_at,
+                previous_state_sha256, state_sha256
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "edge-replay",
+                1,
+                7,
+                "redis-b",
+                100,
+                snapshot().replid_sha256,
+                NOW,
+                None,
+                legacy_digest,
+            ),
+        )
+
+    ledger = SQLitePromotionAuthority(database, "edge-replay")
+    legacy = ledger.snapshot()
+    state = advance(
+        ledger,
+        epoch=8,
+        minimum_offset=110,
+        observed_at=NOW + 1,
+        expected=legacy_digest,
+        source_sha256="b" * 64,
+    )
+
+    assert legacy is not None
+    assert legacy.schema_version == 1
+    assert legacy.source_sha256 is None
+    assert legacy.state_sha256 == legacy_digest
+    assert state.schema_version == 2
+    assert state.source_sha256 == "b" * 64
+    assert state.previous_state_sha256 == legacy_digest
+    with sqlite3.connect(database) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(promotion_authority_revisions)"
+            )
+        }
+    assert {"schema_version", "source_sha256"}.issubset(columns)
 
 
 def test_separate_clusters_share_database_without_state_leakage(tmp_path: Path) -> None:

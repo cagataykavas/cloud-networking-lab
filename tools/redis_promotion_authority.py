@@ -20,7 +20,8 @@ from tools.redis_promotion_proof import (
 )
 
 
-SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
+LEGACY_SCHEMA_VERSION = 1
 
 
 class PromotionAuthorityError(RuntimeError):
@@ -41,18 +42,20 @@ class PromotionAuthorityUnavailable(PromotionAuthorityError):
 
 @dataclass(frozen=True)
 class PromotionAuthorityState:
+    schema_version: int
     cluster_id: str
     revision: int
     authority_epoch: int
     candidate_id: str
     minimum_replication_offset: int
     replid_sha256: str
+    source_sha256: str | None
     observed_at: int
     previous_state_sha256: str | None
     state_sha256: str
 
     def payload(self) -> dict[str, str | int | None]:
-        return {
+        payload: dict[str, str | int | None] = {
             "authority_epoch": self.authority_epoch,
             "candidate_id": self.candidate_id,
             "cluster_id": self.cluster_id,
@@ -61,8 +64,11 @@ class PromotionAuthorityState:
             "previous_state_sha256": self.previous_state_sha256,
             "replid_sha256": self.replid_sha256,
             "revision": self.revision,
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": self.schema_version,
         }
+        if self.schema_version >= CURRENT_SCHEMA_VERSION:
+            payload["source_sha256"] = self.source_sha256
+        return payload
 
 
 class SQLitePromotionAuthority:
@@ -123,6 +129,9 @@ class SQLitePromotionAuthority:
                         minimum_replication_offset INTEGER NOT NULL
                             CHECK (minimum_replication_offset >= 0),
                         replid_sha256 TEXT NOT NULL,
+                        schema_version INTEGER NOT NULL DEFAULT 1
+                            CHECK (schema_version IN (1, 2)),
+                        source_sha256 TEXT,
                         observed_at INTEGER NOT NULL CHECK (observed_at >= 0),
                         previous_state_sha256 TEXT,
                         state_sha256 TEXT NOT NULL,
@@ -132,6 +141,27 @@ class SQLitePromotionAuthority:
                     ) WITHOUT ROWID
                     """
                 )
+                columns = {
+                    row["name"]
+                    for row in connection.execute(
+                        "PRAGMA table_info(promotion_authority_revisions)"
+                    )
+                }
+                if "schema_version" not in columns:
+                    connection.execute(
+                        """
+                        ALTER TABLE promotion_authority_revisions
+                        ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1
+                        CHECK (schema_version IN (1, 2))
+                        """
+                    )
+                if "source_sha256" not in columns:
+                    connection.execute(
+                        """
+                        ALTER TABLE promotion_authority_revisions
+                        ADD COLUMN source_sha256 TEXT
+                        """
+                    )
                 connection.execute(
                     """
                     CREATE TRIGGER IF NOT EXISTS promotion_authority_no_update
@@ -178,6 +208,7 @@ class SQLitePromotionAuthority:
         candidate_id: str,
         minimum_replication_offset: int,
         snapshot: RedisReplicationSnapshot,
+        source_sha256: str | None = None,
         observed_at: int,
         expected_state_sha256: str | None,
     ) -> PromotionAuthorityState:
@@ -189,6 +220,7 @@ class SQLitePromotionAuthority:
             minimum_replication_offset, "minimum_replication_offset"
         )
         timestamp = _nonnegative_integer(observed_at, "observed_at")
+        source_digest = _optional_digest(source_sha256, "source_sha256")
         _optional_digest(expected_state_sha256, "expected_state_sha256")
         if snapshot.role != "master":
             raise ValueError("authority state requires an already promoted master")
@@ -210,6 +242,7 @@ class SQLitePromotionAuthority:
                         candidate,
                         offset,
                         snapshot.replid_sha256,
+                        source_digest,
                         timestamp,
                     )
                     existing = (
@@ -217,6 +250,7 @@ class SQLitePromotionAuthority:
                         current.candidate_id,
                         current.minimum_replication_offset,
                         current.replid_sha256,
+                        current.source_sha256,
                         current.observed_at,
                     )
                     if requested == existing:
@@ -234,6 +268,13 @@ class SQLitePromotionAuthority:
                         raise PromotionAuthorityConflict(
                             "promotion_authority_time_regressed"
                         )
+                    if (
+                        current.schema_version >= CURRENT_SCHEMA_VERSION
+                        and source_digest is None
+                    ):
+                        raise PromotionAuthorityConflict(
+                            "promotion_authority_source_required"
+                        )
 
                 revision = 1 if current is None else current.revision + 1
                 state = _build_state(
@@ -243,6 +284,7 @@ class SQLitePromotionAuthority:
                     candidate_id=candidate,
                     minimum_replication_offset=offset,
                     replid_sha256=snapshot.replid_sha256,
+                    source_sha256=source_digest,
                     observed_at=timestamp,
                     previous_state_sha256=current_digest,
                 )
@@ -251,8 +293,9 @@ class SQLitePromotionAuthority:
                     INSERT INTO promotion_authority_revisions (
                         cluster_id, revision, authority_epoch, candidate_id,
                         minimum_replication_offset, replid_sha256, observed_at,
-                        previous_state_sha256, state_sha256
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        previous_state_sha256, state_sha256, schema_version,
+                        source_sha256
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         state.cluster_id,
@@ -264,6 +307,8 @@ class SQLitePromotionAuthority:
                         state.observed_at,
                         state.previous_state_sha256,
                         state.state_sha256,
+                        state.schema_version,
+                        state.source_sha256,
                     ),
                 )
                 connection.commit()
@@ -368,16 +413,27 @@ class SQLitePromotionAuthority:
 
 
 def _build_state(**values: Any) -> PromotionAuthorityState:
-    unsigned = {"schema_version": SCHEMA_VERSION, **values}
+    schema_version = (
+        CURRENT_SCHEMA_VERSION
+        if values["source_sha256"] is not None
+        else LEGACY_SCHEMA_VERSION
+    )
+    payload = {"schema_version": schema_version, **values}
+    if schema_version == LEGACY_SCHEMA_VERSION:
+        payload.pop("source_sha256")
     return PromotionAuthorityState(
+        schema_version=schema_version,
         **values,
-        state_sha256=_state_digest(unsigned),
+        state_sha256=_state_digest(payload),
     )
 
 
 def _state_from_row(row: sqlite3.Row) -> PromotionAuthorityState:
     try:
         state = PromotionAuthorityState(
+            schema_version=_positive_integer(
+                row["schema_version"], "schema_version"
+            ),
             cluster_id=_identifier(row["cluster_id"], "cluster_id"),
             revision=_positive_integer(row["revision"], "revision"),
             authority_epoch=_nonnegative_integer(
@@ -389,13 +445,29 @@ def _state_from_row(row: sqlite3.Row) -> PromotionAuthorityState:
                 "minimum_replication_offset",
             ),
             replid_sha256=_digest(row["replid_sha256"], "replid_sha256"),
+            source_sha256=_optional_digest(
+                row["source_sha256"], "source_sha256"
+            ),
             observed_at=_nonnegative_integer(row["observed_at"], "observed_at"),
             previous_state_sha256=_optional_digest(
                 row["previous_state_sha256"], "previous_state_sha256"
             ),
             state_sha256=_digest(row["state_sha256"], "state_sha256"),
         )
-    except (TypeError, ValueError) as exc:
+        if state.schema_version not in {
+            LEGACY_SCHEMA_VERSION,
+            CURRENT_SCHEMA_VERSION,
+        }:
+            raise ValueError("unsupported schema_version")
+        if (
+            state.schema_version == LEGACY_SCHEMA_VERSION
+            and state.source_sha256 is not None
+        ) or (
+            state.schema_version >= CURRENT_SCHEMA_VERSION
+            and state.source_sha256 is None
+        ):
+            raise ValueError("source_sha256 does not match schema_version")
+    except (KeyError, TypeError, ValueError) as exc:
         raise PromotionAuthorityCorrupt("promotion_authority_invalid_row") from exc
     return state
 

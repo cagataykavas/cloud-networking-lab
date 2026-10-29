@@ -117,6 +117,7 @@ class SentinelPromotionDecision:
             candidate_id=self.candidate_id,
             minimum_replication_offset=self.minimum_replication_offset,
             snapshot=self.snapshot,
+            source_sha256=self.source_sha256,
             observed_at=self.observed_at,
             expected_state_sha256=expected_state_sha256,
         )
