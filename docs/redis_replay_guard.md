@@ -152,6 +152,7 @@ binds the cluster, monotonic authority epoch, selected candidate, minimum replic
 replication-ID commitment and observation time into a SHA-256 chain. Revisions are append-only,
 written under `BEGIN IMMEDIATE`, revalidated on every operation and protected by no-update/no-delete
 triggers. The database is created with mode `0600`; secrets and raw replication IDs are never stored.
+Source-aware version-2 rows also bind a SHA-256 commitment to the validated election observation.
 
 ```python
 from tools.redis_promotion_authority import SQLitePromotionAuthority
@@ -182,6 +183,11 @@ and require it on the next update and every proof issuance. This compare-and-swa
 concurrent writers and detects a database restored behind that external checkpoint. Exact retries are
 idempotent; reused epochs, decreasing offset floors, regressing observation times, candidate/role/
 replication-ID drift and SQLite lock failures all fail closed.
+
+Existing version-1 databases are migrated in place by adding nullable schema and source columns in
+the same initialization transaction. Their historical digests retain the version-1 payload shape;
+the first source-aware append starts version 2 and chains to the existing head. Once a chain contains
+a version-2 row, later revisions cannot silently omit the source commitment.
 
 The ledger is deliberately a single-host coordination primitive, not Sentinel/Cluster discovery,
 leader election, distributed consensus or Byzantine tamper resistance. Rolling back both the SQLite
@@ -268,9 +274,10 @@ state = decision.advance(
 ```
 
 The returned `source_sha256` commits to privacy-reduced topology evidence without
-including the raw replication ID or endpoint. Persist it with controller audit evidence;
-the current ledger schema intentionally stores only the fields required to issue a
-promotion proof.
+including the raw replication ID or endpoint. `decision.advance(...)` stores that commitment
+in a version-2 ledger row and includes it in `state_sha256`. Consequently, a control-plane
+checkpoint of the authority head also anchors the exact Sentinel evidence used for the
+decision; tampering with either the source commitment or its row breaks chain validation.
 
 Sentinel's quorum field and visible-Sentinel count do **not** prove that a quorum voted
 for a particular leader, and Sentinel does not expose a safe replication-offset floor.
@@ -279,4 +286,9 @@ configured endpoints over an authenticated network, and anchor the ledger head i
 stronger control-plane store. The adapter does not initiate failover, discover arbitrary
 endpoints, fence an old primary, implement consensus, or make Redis Sentinel Byzantine
 fault tolerant.
+
+The next operational increment is a disposable three-Sentinel failover topology that exercises
+the live adapter and verifies the checkpointed source across a real election. That drill still
+cannot replace an authenticated production network, a rollback-protected external checkpoint,
+or explicit old-primary fencing.
 

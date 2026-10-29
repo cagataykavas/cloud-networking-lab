@@ -143,6 +143,32 @@ def test_observes_live_clients_and_advances_authority(tmp_path: Path) -> None:
     assert state.candidate_id == RUN_ID
     assert state.minimum_replication_offset == 1_200
     assert state.replid_sha256 == decision.snapshot.replid_sha256
+    assert state.schema_version == 2
+    assert state.source_sha256 == decision.source_sha256
+
+
+def test_source_commitment_is_bound_into_authority_head(tmp_path: Path) -> None:
+    authority = SQLitePromotionAuthority(
+        tmp_path / "authority.db",
+        "edge-replay",
+    )
+    first_decision = derive()
+    first = first_decision.advance(authority, expected_state_sha256=None)
+    second_decision = derive(
+        reply=sentinel_reply(**{"config-epoch": "43"}),
+        info=candidate_info(offset=1_300),
+        floor=1_250,
+    )
+    second = second_decision.advance(
+        authority,
+        expected_state_sha256=first.state_sha256,
+    )
+
+    assert first.source_sha256 == first_decision.source_sha256
+    assert second.source_sha256 == second_decision.source_sha256
+    assert second.previous_state_sha256 == first.state_sha256
+    assert second.state_sha256 != first.state_sha256
+    assert authority.snapshot() == second
 
 
 def test_accepts_mapping_reply_and_returns_stable_commitment() -> None:
