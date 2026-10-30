@@ -249,10 +249,13 @@ from redis import Redis
 from tools.redis_promotion_authority import SQLitePromotionAuthority
 from tools.redis_sentinel_promotion import (
     SentinelPromotionPolicy,
-    observe_sentinel_promotion,
+    observe_sentinel_consensus,
 )
 
-sentinel = Redis(host="sentinel-a", port=26379, decode_responses=False)
+sentinels = {
+    name: Redis(host=name, port=26379, decode_responses=False)
+    for name in ("sentinel-a", "sentinel-b", "sentinel-c")
+}
 candidate = Redis(host="10.0.0.12", port=6379, decode_responses=True)
 policy = SentinelPromotionPolicy(
     master_name="replay-primary",
@@ -260,8 +263,8 @@ policy = SentinelPromotionPolicy(
     candidate_port=6379,
     minimum_config_epoch=42,
 )
-decision = observe_sentinel_promotion(
-    sentinel,
+decision = observe_sentinel_consensus(
+    sentinels,
     candidate,
     policy,
     minimum_replication_offset=durable_pre_failover_offset,
@@ -279,8 +282,17 @@ in a version-2 ledger row and includes it in `state_sha256`. Consequently, a con
 checkpoint of the authority head also anchors the exact Sentinel evidence used for the
 decision; tampering with either the source commitment or its row breaks chain validation.
 
-Sentinel's quorum field and visible-Sentinel count do **not** prove that a quorum voted
-for a particular leader, and Sentinel does not expose a safe replication-offset floor.
+`observe_sentinel_consensus` accepts 3–9 distinctly identified clients, obtains the candidate
+replication snapshot once, and requires every configured observer to return the same candidate,
+configuration epoch and candidate snapshot under the normal safety checks. Its combined commitment
+is deterministic across mapping order and contains hashes of observer identifiers plus each
+privacy-reduced source commitment. A missing, malformed, unsafe or dissenting view fails the whole
+decision; no partial threshold is silently accepted. The single-observer function remains available
+for deployments whose externally governed control plane already performs corroboration.
+
+Matching observations and Sentinel's quorum/peer-count fields do **not** prove that a quorum voted
+for a particular leader, that configured clients reach independent processes, or that an old primary
+has been fenced. Sentinel also does not expose a safe replication-offset floor.
 The caller must retain that floor before failover, use a trusted clock, connect to the
 configured endpoints over an authenticated network, and anchor the ledger head in a
 stronger control-plane store. The adapter does not initiate failover, discover arbitrary

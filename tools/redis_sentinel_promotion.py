@@ -5,8 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Protocol
 
 from tools.redis_promotion_authority import (
     PromotionAuthorityState,
@@ -153,6 +154,96 @@ def observe_sentinel_promotion(
         policy,
         minimum_replication_offset=minimum_replication_offset,
         observed_at=observed_at,
+    )
+
+
+def observe_sentinel_consensus(
+    sentinels: Mapping[str, SentinelClient],
+    candidate: CandidateClient,
+    policy: SentinelPromotionPolicy,
+    *,
+    minimum_replication_offset: int,
+    observed_at: int,
+) -> SentinelPromotionDecision:
+    """Require every configured Sentinel observer to corroborate one safe view."""
+
+    if not isinstance(sentinels, Mapping) or not 3 <= len(sentinels) <= 9:
+        raise ValueError("sentinels must contain between 3 and 9 observers")
+    for observer_id in sentinels:
+        _identifier(observer_id, "observer_id")
+    observer_ids = sorted(sentinels)
+    clients = [sentinels[observer_id] for observer_id in observer_ids]
+    if len({id(client) for client in clients}) != len(clients):
+        raise ValueError("sentinel observers must use distinct client instances")
+
+    try:
+        candidate_info = candidate.info("replication")
+    except Exception as exc:
+        raise SentinelPromotionUnavailable(
+            "candidate_replication_observation_unavailable"
+        ) from exc
+
+    observations: list[tuple[str, SentinelPromotionDecision]] = []
+    for observer_id, sentinel in zip(observer_ids, clients, strict=True):
+        try:
+            master_reply = sentinel.execute_command(
+                "SENTINEL", "MASTER", policy.master_name
+            )
+        except Exception as exc:
+            raise SentinelPromotionUnavailable(
+                "sentinel_consensus_observation_unavailable"
+            ) from exc
+        observations.append(
+            (
+                observer_id,
+                derive_sentinel_promotion(
+                    master_reply,
+                    candidate_info,
+                    policy,
+                    minimum_replication_offset=minimum_replication_offset,
+                    observed_at=observed_at,
+                ),
+            )
+        )
+
+    first = observations[0][1]
+    agreement = {
+        (
+            decision.candidate_id,
+            decision.authority_epoch,
+            decision.minimum_replication_offset,
+            decision.snapshot,
+        )
+        for _, decision in observations
+    }
+    if len(agreement) != 1:
+        raise SentinelPromotionRejected("sentinel_observers_disagree")
+
+    combined_source = {
+        "agreement": "unanimous",
+        "authority_epoch": first.authority_epoch,
+        "candidate_id": first.candidate_id,
+        "minimum_replication_offset": first.minimum_replication_offset,
+        "observed_at": first.observed_at,
+        "observer_commitments": [
+            {
+                "observer_id_sha256": hashlib.sha256(
+                    observer_id.encode("ascii")
+                ).hexdigest(),
+                "source_sha256": decision.source_sha256,
+            }
+            for observer_id, decision in observations
+        ],
+        "observer_count": len(observations),
+        "schema_version": 1,
+    }
+    return SentinelPromotionDecision(
+        candidate_id=first.candidate_id,
+        authority_epoch=first.authority_epoch,
+        minimum_replication_offset=first.minimum_replication_offset,
+        snapshot=first.snapshot,
+        observed_at=first.observed_at,
+        source_sha256=hashlib.sha256(_canonical(combined_source)).hexdigest(),
     )
 
 

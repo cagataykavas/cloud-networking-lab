@@ -11,6 +11,7 @@ from tools.redis_sentinel_promotion import (
     SentinelPromotionRejected,
     SentinelPromotionUnavailable,
     derive_sentinel_promotion,
+    observe_sentinel_consensus,
     observe_sentinel_promotion,
 )
 
@@ -169,6 +170,115 @@ def test_source_commitment_is_bound_into_authority_head(tmp_path: Path) -> None:
     assert second.previous_state_sha256 == first.state_sha256
     assert second.state_sha256 != first.state_sha256
     assert authority.snapshot() == second
+
+
+def test_three_observers_bind_unanimous_view_into_authority(tmp_path: Path) -> None:
+    candidate = FakeCandidate()
+    observers = {
+        "sentinel-c": FakeSentinel(sentinel_reply(**{"last-ok-ping-reply": "19"})),
+        "sentinel-a": FakeSentinel(),
+        "sentinel-b": FakeSentinel(sentinel_reply(**{"info-refresh": "29"})),
+    }
+
+    decision = observe_sentinel_consensus(
+        observers,
+        candidate,
+        policy(),
+        minimum_replication_offset=1_200,
+        observed_at=NOW,
+    )
+    reordered = observe_sentinel_consensus(
+        {
+            observer_id: FakeSentinel(observers[observer_id].reply)
+            for observer_id in reversed(observers)
+        },
+        FakeCandidate(),
+        policy(),
+        minimum_replication_offset=1_200,
+        observed_at=NOW,
+    )
+    state = decision.advance(
+        SQLitePromotionAuthority(tmp_path / "authority.db", "edge-replay"),
+        expected_state_sha256=None,
+    )
+
+    assert candidate.calls == ["replication"]
+    assert all(
+        observer.calls == [("SENTINEL", "MASTER", "replay-primary")]
+        for observer in observers.values()
+    )
+    assert decision.source_sha256 == reordered.source_sha256
+    assert state.source_sha256 == decision.source_sha256
+    assert "sentinel-a" not in repr(decision)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"config-epoch": "43"},
+        {"runid": "c" * 40},
+    ],
+)
+def test_consensus_rejects_dissenting_safe_view(change: dict[str, str]) -> None:
+    observers = {
+        "sentinel-a": FakeSentinel(),
+        "sentinel-b": FakeSentinel(),
+        "sentinel-c": FakeSentinel(sentinel_reply(**change)),
+    }
+
+    with pytest.raises(SentinelPromotionRejected, match="observers_disagree"):
+        observe_sentinel_consensus(
+            observers,
+            FakeCandidate(),
+            policy(),
+            minimum_replication_offset=1_200,
+            observed_at=NOW,
+        )
+
+
+def test_consensus_fails_closed_on_missing_or_reused_observer() -> None:
+    shared = FakeSentinel()
+    with pytest.raises(ValueError, match="between 3 and 9"):
+        observe_sentinel_consensus(
+            {"sentinel-a": shared, "sentinel-b": FakeSentinel()},
+            FakeCandidate(),
+            policy(),
+            minimum_replication_offset=1_200,
+            observed_at=NOW,
+        )
+
+    with pytest.raises(ValueError, match="distinct client instances"):
+        observe_sentinel_consensus(
+            {
+                "sentinel-a": shared,
+                "sentinel-b": shared,
+                "sentinel-c": FakeSentinel(),
+            },
+            FakeCandidate(),
+            policy(),
+            minimum_replication_offset=1_200,
+            observed_at=NOW,
+        )
+
+
+def test_consensus_normalizes_observer_transport_failures() -> None:
+    observers = {
+        "sentinel-a": FakeSentinel(),
+        "sentinel-b": FakeSentinel(error=OSError("secret endpoint")),
+        "sentinel-c": FakeSentinel(),
+    }
+
+    with pytest.raises(
+        SentinelPromotionUnavailable,
+        match="sentinel_consensus_observation_unavailable",
+    ):
+        observe_sentinel_consensus(
+            observers,
+            FakeCandidate(),
+            policy(),
+            minimum_replication_offset=1_200,
+            observed_at=NOW,
+        )
 
 
 def test_accepts_mapping_reply_and_returns_stable_commitment() -> None:
