@@ -49,4 +49,39 @@ jobs:
       - name: Stop isolated Redis failover pair
         if: always()
         run: docker compose --profile redis-failover down --volumes
+      - name: Start isolated three-Sentinel election topology
+        run: >-
+          docker compose --profile redis-sentinel-election up -d --wait
+          redis_election_primary redis_election_replica
+          redis_election_sentinel_a redis_election_sentinel_b redis_election_sentinel_c
+      - name: Exercise Sentinel election and former-primary isolation
+        id: sentinel_election_drill
+        run: >-
+          python -m tools.redis_sentinel_election_drill
+          --primary-url redis://127.0.0.1:16479/0
+          --candidate-url redis://127.0.0.1:16480/0
+          --sentinel-url redis://127.0.0.1:26479/0
+          --sentinel-url redis://127.0.0.1:26480/0
+          --sentinel-url redis://127.0.0.1:26481/0
+          --candidate-advertised-host 172.30.0.11
+          --candidate-advertised-port 6379
+          --receipt "${RUNNER_TEMP}/redis-sentinel-election-receipt.json"
+          --timeout-seconds 30
+      - name: Archive Sentinel election evidence
+        if: ${{ always() && (steps.sentinel_election_drill.outcome == 'success' || steps.sentinel_election_drill.outcome == 'failure') }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: redis-sentinel-election-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/redis-sentinel-election-receipt.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Report Sentinel election diagnostics
+        if: failure()
+        run: >-
+          docker compose --profile redis-sentinel-election logs --no-color --tail 200
+          redis_election_primary redis_election_replica
+          redis_election_sentinel_a redis_election_sentinel_b redis_election_sentinel_c
+      - name: Stop isolated three-Sentinel election topology
+        if: always()
+        run: docker compose --profile redis-sentinel-election down --volumes
       - run: docker build -t cloud-networking-lab:test .
