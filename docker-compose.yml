@@ -83,7 +83,8 @@ services:
       timeout: 1s
       retries: 30
     networks:
-      - redis_election_lab
+      redis_election_lab:
+        ipv4_address: 172.30.0.10
 
   redis_election_replica:
     image: redis:8.2.10-alpine
@@ -100,7 +101,7 @@ services:
       - redis_election_primary
       - "6379"
       - --replica-announce-ip
-      - redis_election_replica
+      - 172.30.0.11
       - --replica-announce-port
       - "6379"
     ports:
@@ -114,7 +115,8 @@ services:
       timeout: 1s
       retries: 30
     networks:
-      - redis_election_lab
+      redis_election_lab:
+        ipv4_address: 172.30.0.11
 
   redis_election_sentinel_a:
     image: redis:8.2.10-alpine
@@ -133,7 +135,8 @@ services:
       timeout: 1s
       retries: 30
     networks:
-      - redis_election_lab
+      redis_election_lab:
+        ipv4_address: 172.30.0.21
 
   redis_election_sentinel_b:
     image: redis:8.2.10-alpine
@@ -152,7 +155,8 @@ services:
       timeout: 1s
       retries: 30
     networks:
-      - redis_election_lab
+      redis_election_lab:
+        ipv4_address: 172.30.0.22
 
   redis_election_sentinel_c:
     image: redis:8.2.10-alpine
@@ -171,7 +175,8 @@ services:
       timeout: 1s
       retries: 30
     networks:
-      - redis_election_lab
+      redis_election_lab:
+        ipv4_address: 172.30.0.23
 
 networks:
   edge:
@@ -189,3 +194,6 @@ networks:
     driver: bridge
   redis_election_lab:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

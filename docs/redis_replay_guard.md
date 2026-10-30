@@ -306,6 +306,9 @@ Sentinel processes. The drill writes and replica-acknowledges a synchronization 
 resulting replication-offset floor, then shuts down the primary and waits for a real quorum election.
 Replay admission remains closed until all three Sentinels report the same promoted candidate, the
 candidate is a master at or above the offset floor, and the former primary is unreachable.
+The isolated bridge assigns stable lab-only addresses to the primary and replica. Sentinel can
+therefore keep monitoring the stopped primary's address after Docker removes the container's DNS
+record; the addresses are not production discovery guidance and are never included in the receipt.
 
 Only after those checks does the drill append the corroborated source commitment to a fresh
 hash-chained authority ledger, issue a short-lived proof from the exact authority head, verify that
@@ -323,7 +326,7 @@ python -m tools.redis_sentinel_election_drill \
   --sentinel-url redis://127.0.0.1:26479/0 \
   --sentinel-url redis://127.0.0.1:26480/0 \
   --sentinel-url redis://127.0.0.1:26481/0 \
-  --candidate-advertised-host redis_election_replica \
+  --candidate-advertised-host 172.30.0.11 \
   --candidate-advertised-port 6379 \
   --receipt /tmp/redis-sentinel-election-receipt.json
 docker compose --profile redis-sentinel-election down --volumes

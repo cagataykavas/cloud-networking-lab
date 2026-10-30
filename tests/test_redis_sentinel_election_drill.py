@@ -101,6 +101,7 @@ def test_ci_runs_three_sentinel_election_and_archives_evidence() -> None:
 
 def test_compose_declares_three_independent_sentinel_processes() -> None:
     compose = Path("docker-compose.yml").read_text(encoding="utf-8")
+    sentinel = Path("ops/redis-sentinel/sentinel.conf").read_text(encoding="utf-8")
 
     assert compose.count('profiles: ["redis-sentinel-election"]') == 5
     assert compose.count("exec redis-sentinel /tmp/sentinel.conf") == 3
@@ -108,3 +109,16 @@ def test_compose_declares_three_independent_sentinel_processes() -> None:
     assert "127.0.0.1:26480:26379" in compose
     assert "127.0.0.1:26481:26379" in compose
     assert "./ops/redis-sentinel:/template:ro" in compose
+    assert "subnet: 172.30.0.0/24" in compose
+    for address in (
+        "172.30.0.10",
+        "172.30.0.11",
+        "172.30.0.21",
+        "172.30.0.22",
+        "172.30.0.23",
+    ):
+        assert compose.count(f"ipv4_address: {address}") == 1
+    assert "--replica-announce-ip\n      - 172.30.0.11" in compose
+    assert "sentinel monitor replay-primary 172.30.0.10 6379 2" in sentinel
+    assert "resolve-hostnames" not in sentinel
+    assert "announce-hostnames" not in sentinel

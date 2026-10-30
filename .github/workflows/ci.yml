@@ -63,7 +63,7 @@ jobs:
           --sentinel-url redis://127.0.0.1:26479/0
           --sentinel-url redis://127.0.0.1:26480/0
           --sentinel-url redis://127.0.0.1:26481/0
-          --candidate-advertised-host redis_election_replica
+          --candidate-advertised-host 172.30.0.11
           --candidate-advertised-port 6379
           --receipt "${RUNNER_TEMP}/redis-sentinel-election-receipt.json"
           --timeout-seconds 30
