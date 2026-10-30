@@ -71,6 +71,108 @@ services:
     networks:
       - redis_fault_lab
 
+  redis_election_primary:
+    image: redis:8.2.10-alpine
+    profiles: ["redis-sentinel-election"]
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--protected-mode", "no"]
+    ports:
+      - "127.0.0.1:16479:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    networks:
+      - redis_election_lab
+
+  redis_election_replica:
+    image: redis:8.2.10-alpine
+    profiles: ["redis-sentinel-election"]
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --protected-mode
+      - "no"
+      - --replicaof
+      - redis_election_primary
+      - "6379"
+      - --replica-announce-ip
+      - redis_election_replica
+      - --replica-announce-port
+      - "6379"
+    ports:
+      - "127.0.0.1:16480:6379"
+    depends_on:
+      redis_election_primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    networks:
+      - redis_election_lab
+
+  redis_election_sentinel_a:
+    image: redis:8.2.10-alpine
+    profiles: ["redis-sentinel-election"]
+    command: ["sh", "-c", "cp /template/sentinel.conf /tmp/sentinel.conf && exec redis-sentinel /tmp/sentinel.conf"]
+    ports:
+      - "127.0.0.1:26479:26379"
+    volumes:
+      - ./ops/redis-sentinel:/template:ro
+    depends_on:
+      redis_election_replica:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    networks:
+      - redis_election_lab
+
+  redis_election_sentinel_b:
+    image: redis:8.2.10-alpine
+    profiles: ["redis-sentinel-election"]
+    command: ["sh", "-c", "cp /template/sentinel.conf /tmp/sentinel.conf && exec redis-sentinel /tmp/sentinel.conf"]
+    ports:
+      - "127.0.0.1:26480:26379"
+    volumes:
+      - ./ops/redis-sentinel:/template:ro
+    depends_on:
+      redis_election_replica:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    networks:
+      - redis_election_lab
+
+  redis_election_sentinel_c:
+    image: redis:8.2.10-alpine
+    profiles: ["redis-sentinel-election"]
+    command: ["sh", "-c", "cp /template/sentinel.conf /tmp/sentinel.conf && exec redis-sentinel /tmp/sentinel.conf"]
+    ports:
+      - "127.0.0.1:26481:26379"
+    volumes:
+      - ./ops/redis-sentinel:/template:ro
+    depends_on:
+      redis_election_replica:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    networks:
+      - redis_election_lab
+
 networks:
   edge:
     driver: bridge
@@ -84,4 +186,6 @@ networks:
       config:
         - subnet: 172.29.0.0/24
   redis_fault_lab:
+    driver: bridge
+  redis_election_lab:
     driver: bridge

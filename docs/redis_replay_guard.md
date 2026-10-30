@@ -299,8 +299,40 @@ stronger control-plane store. The adapter does not initiate failover, discover a
 endpoints, fence an old primary, implement consensus, or make Redis Sentinel Byzantine
 fault tolerant.
 
-The next operational increment is a disposable three-Sentinel failover topology that exercises
-the live adapter and verifies the checkpointed source across a real election. That drill still
-cannot replace an authenticated production network, a rollback-protected external checkpoint,
-or explicit old-primary fencing.
+### Disposable three-Sentinel election drill
+
+Pull-request CI starts an isolated Redis primary, one synchronized replica and three independent
+Sentinel processes. The drill writes and replica-acknowledges a synchronization marker, records the
+resulting replication-offset floor, then shuts down the primary and waits for a real quorum election.
+Replay admission remains closed until all three Sentinels report the same promoted candidate, the
+candidate is a master at or above the offset floor, and the former primary is unreachable.
+
+Only after those checks does the drill append the corroborated source commitment to a fresh
+hash-chained authority ledger, issue a short-lived proof from the exact authority head, verify that
+proof against a fresh candidate snapshot, and execute one replay claim. The archived receipt records
+hashes, offsets, the authority epoch and boolean boundary results; it omits Redis/Sentinel endpoints,
+raw run IDs, raw replication IDs, proof keys and replay tokens.
+
+```bash
+docker compose --profile redis-sentinel-election up -d --wait \
+  redis_election_primary redis_election_replica \
+  redis_election_sentinel_a redis_election_sentinel_b redis_election_sentinel_c
+python -m tools.redis_sentinel_election_drill \
+  --primary-url redis://127.0.0.1:16479/0 \
+  --candidate-url redis://127.0.0.1:16480/0 \
+  --sentinel-url redis://127.0.0.1:26479/0 \
+  --sentinel-url redis://127.0.0.1:26480/0 \
+  --sentinel-url redis://127.0.0.1:26481/0 \
+  --candidate-advertised-host redis_election_replica \
+  --candidate-advertised-port 6379 \
+  --receipt /tmp/redis-sentinel-election-receipt.json
+docker compose --profile redis-sentinel-election down --volumes
+```
+
+This proves the repository's corroboration and admission sequence against one real Sentinel election.
+It is not a split-brain test: the former primary is shut down cleanly rather than kept alive behind
+an asymmetric partition. The topology has one promotion candidate, no post-promotion replica
+durability requirement, no ACL/TLS boundary and no Byzantine-fault claim. A stronger next step is to
+keep the former primary alive behind a one-way partition and use an external lease/epoch authority
+to prove it cannot regain write authority after connectivity returns.
 
