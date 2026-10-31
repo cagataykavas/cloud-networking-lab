@@ -152,28 +152,35 @@ def run_election_drill(
                 secret=secret,
             )
             current = RedisReplicationSnapshot.from_info(candidate.info("replication"))
-            authorization, _ = execute_after_promotion_proof(
-                proof,
-                RedisPromotionPolicy(
-                    cluster_id="redis-sentinel-election",
-                    candidate_id=decision.candidate_id,
-                    minimum_authority_epoch=state.authority_epoch,
-                    keyring={"drill-ephemeral": secret},
-                ),
-                current,
-                now=issued_at,
-                operation=lambda: RedisReplayGuard(
-                    candidate,
-                    RedisReplayGuardPolicy(
-                        namespace=f"sentinel-election-{run_id}",
-                        required_replica_acks=0,
+            fenced_state, (authorization, _) = authority.execute_under_epoch_fence(
+                expected_state_sha256=state.state_sha256,
+                candidate_id=decision.candidate_id,
+                operation=lambda: execute_after_promotion_proof(
+                    proof,
+                    RedisPromotionPolicy(
+                        cluster_id="redis-sentinel-election",
+                        candidate_id=decision.candidate_id,
+                        minimum_authority_epoch=state.authority_epoch,
+                        keyring={"drill-ephemeral": secret},
                     ),
-                ).claim(claim_sha256),
+                    current,
+                    now=issued_at,
+                    operation=lambda: RedisReplayGuard(
+                        candidate,
+                        RedisReplayGuardPolicy(
+                            namespace=f"sentinel-election-{run_id}",
+                            required_replica_acks=0,
+                        ),
+                    ).claim(claim_sha256),
+                ),
             )
+            if fenced_state != state:
+                raise RuntimeError("epoch fence returned an unexpected authority head")
 
         return {
             "boundary": {
                 "authority_advanced_before_admission": True,
+                "external_epoch_fence_held_during_admission": True,
                 "former_primary_isolated_before_admission": True,
                 "three_sentinel_views_unanimous": True,
             },

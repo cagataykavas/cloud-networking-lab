@@ -312,7 +312,14 @@ record; the addresses are not production discovery guidance and are never includ
 
 Only after those checks does the drill append the corroborated source commitment to a fresh
 hash-chained authority ledger, issue a short-lived proof from the exact authority head, verify that
-proof against a fresh candidate snapshot, and execute one replay claim. The archived receipt records
+proof against a fresh candidate snapshot, and execute one replay claim. Proof verification and the
+claim run inside an `IMMEDIATE` transaction on the external authority ledger. This prevents an epoch
+advance from interleaving between authorization and the Redis write, while a stale head or candidate
+is rejected before the write callback runs. Every protected write path must use this boundary; it
+does not prevent clients that bypass the application fence from writing directly to Redis. Keep the
+callback bounded because authority advances are serialized until it returns.
+
+The archived receipt records
 hashes, offsets, the authority epoch and boolean boundary results; it omits Redis/Sentinel endpoints,
 raw run IDs, raw replication IDs, proof keys and replay tokens.
 
@@ -334,8 +341,10 @@ docker compose --profile redis-sentinel-election down --volumes
 
 This proves the repository's corroboration and admission sequence against one real Sentinel election.
 It is not a split-brain test: the former primary is shut down cleanly rather than kept alive behind
-an asymmetric partition. The topology has one promotion candidate, no post-promotion replica
+an asymmetric partition. The external epoch fence closes the in-process proof-to-write race, but CI
+does not yet reconnect a stale former primary and attempt a fenced write through it. The topology
+has one promotion candidate, no post-promotion replica
 durability requirement, no ACL/TLS boundary and no Byzantine-fault claim. A stronger next step is to
-keep the former primary alive behind a one-way partition and use an external lease/epoch authority
-to prove it cannot regain write authority after connectivity returns.
+keep the former primary alive behind a one-way partition, restore connectivity after promotion, and
+prove its stale authority head cannot enter the fenced write callback.
 

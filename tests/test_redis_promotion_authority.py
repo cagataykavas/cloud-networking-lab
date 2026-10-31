@@ -228,6 +228,147 @@ def test_stale_writer_cannot_append_or_issue_proof(tmp_path: Path) -> None:
     assert ledger.snapshot() == second
 
 
+def test_executes_write_only_under_exact_current_epoch_fence(tmp_path: Path) -> None:
+    ledger = authority(tmp_path)
+    state = advance(ledger)
+    calls: list[str] = []
+
+    fenced_state, result = ledger.execute_under_epoch_fence(
+        expected_state_sha256=state.state_sha256,
+        candidate_id="redis-b",
+        operation=lambda: calls.append("write") or "accepted",
+    )
+
+    assert fenced_state == state
+    assert result == "accepted"
+    assert calls == ["write"]
+
+
+@pytest.mark.parametrize(
+    ("expected", "candidate", "reason"),
+    [
+        ("0" * 64, "redis-b", "head_mismatch"),
+        (None, "redis-a", "candidate_mismatch"),
+    ],
+)
+def test_stale_or_wrong_candidate_never_enters_fenced_operation(
+    tmp_path: Path,
+    expected: str | None,
+    candidate: str,
+    reason: str,
+) -> None:
+    ledger = authority(tmp_path)
+    state = advance(ledger)
+    calls: list[str] = []
+
+    with pytest.raises(PromotionAuthorityConflict, match=reason):
+        ledger.execute_under_epoch_fence(
+            expected_state_sha256=expected or state.state_sha256,
+            candidate_id=candidate,
+            operation=lambda: calls.append("unsafe-write"),
+        )
+
+    assert calls == []
+
+
+def test_authority_advance_cannot_interleave_with_fenced_write(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "authority.db"
+    ledger = SQLitePromotionAuthority(database, "edge-replay")
+    contender = SQLitePromotionAuthority(
+        database,
+        "edge-replay",
+        busy_timeout_seconds=0.01,
+    )
+    first = advance(ledger)
+
+    def bounded_write() -> str:
+        with pytest.raises(PromotionAuthorityUnavailable):
+            advance(
+                contender,
+                epoch=8,
+                candidate="redis-c",
+                minimum_offset=120,
+                current=snapshot(replid="b" * 40, offset=130),
+                observed_at=NOW + 1,
+                expected=first.state_sha256,
+            )
+        return "accepted"
+
+    fenced_state, result = ledger.execute_under_epoch_fence(
+        expected_state_sha256=first.state_sha256,
+        candidate_id="redis-b",
+        operation=bounded_write,
+    )
+    second = advance(
+        contender,
+        epoch=8,
+        candidate="redis-c",
+        minimum_offset=120,
+        current=snapshot(replid="b" * 40, offset=130),
+        observed_at=NOW + 1,
+        expected=first.state_sha256,
+    )
+
+    assert fenced_state == first
+    assert result == "accepted"
+    assert second.authority_epoch == 8
+
+
+def test_reconnected_former_primary_stale_head_never_runs_write(
+    tmp_path: Path,
+) -> None:
+    ledger = authority(tmp_path)
+    former = advance(ledger)
+    promoted = advance(
+        ledger,
+        epoch=8,
+        candidate="redis-c",
+        minimum_offset=120,
+        current=snapshot(replid="b" * 40, offset=130),
+        observed_at=NOW + 1,
+        expected=former.state_sha256,
+    )
+    calls: list[str] = []
+
+    with pytest.raises(PromotionAuthorityConflict, match="head_mismatch"):
+        ledger.execute_under_epoch_fence(
+            expected_state_sha256=former.state_sha256,
+            candidate_id="redis-b",
+            operation=lambda: calls.append("stale-write"),
+        )
+
+    assert calls == []
+    assert ledger.snapshot() == promoted
+
+
+def test_failed_fenced_write_releases_authority_lock(tmp_path: Path) -> None:
+    ledger = authority(tmp_path)
+    first = advance(ledger)
+
+    def fail() -> None:
+        raise RuntimeError("redis_write_failed")
+
+    with pytest.raises(RuntimeError, match="redis_write_failed"):
+        ledger.execute_under_epoch_fence(
+            expected_state_sha256=first.state_sha256,
+            candidate_id="redis-b",
+            operation=fail,
+        )
+
+    second = advance(
+        ledger,
+        epoch=8,
+        candidate="redis-c",
+        minimum_offset=120,
+        current=snapshot(replid="b" * 40, offset=130),
+        observed_at=NOW + 1,
+        expected=first.state_sha256,
+    )
+    assert second.authority_epoch == 8
+
+
 def test_external_head_detects_database_restore_rollback(tmp_path: Path) -> None:
     database = tmp_path / "authority.db"
     backup = tmp_path / "authority-backup.db"
