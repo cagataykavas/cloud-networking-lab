@@ -303,21 +303,30 @@ fault tolerant.
 
 Pull-request CI starts an isolated Redis primary, one synchronized replica and three independent
 Sentinel processes. The drill writes and replica-acknowledges a synchronization marker, records the
-resulting replication-offset floor, then shuts down the primary and waits for a real quorum election.
-Replay admission remains closed until all three Sentinels report the same promoted candidate, the
-candidate is a master at or above the offset floor, and the former primary is unreachable.
+resulting replication-offset floor, and commits the live primary into an initial authority head.
+It then installs explicit `OUTPUT` drops from the primary only to the replica and three Sentinels.
+Inbound packets are not dropped, and the bridge gateway is not a target, so the old primary remains
+alive and writable from the host while its peer replies disappear. Replay admission remains closed
+until all three Sentinels report the same promoted candidate at or above the retained offset floor.
 The isolated bridge assigns stable lab-only addresses to the primary and replica. Sentinel can
 therefore keep monitoring the stopped primary's address after Docker removes the container's DNS
 record; the addresses are not production discovery guidance and are never included in the receipt.
 
-Only after those checks does the drill append the corroborated source commitment to a fresh
-hash-chained authority ledger, issue a short-lived proof from the exact authority head, verify that
-proof against a fresh candidate snapshot, and execute one replay claim. Proof verification and the
+The drill proves the still-live old primary accepts an isolated write that is absent from the new
+primary, then advances the hash-chained authority ledger to the corroborated candidate. It issues a
+short-lived proof from that exact head, verifies it against a fresh candidate snapshot, and executes
+one replay claim. Proof verification and the
 claim run inside an `IMMEDIATE` transaction on the external authority ledger. This prevents an epoch
 advance from interleaving between authorization and the Redis write, while a stale head or candidate
 is rejected before the write callback runs. Every protected write path must use this boundary; it
 does not prevent clients that bypass the application fence from writing directly to Redis. Keep the
 callback bounded because authority advances are serialized until it returns.
+
+After admission, the controller removes every installed drop rule and waits for Sentinel to
+reconfigure the old primary as a synchronized replica. The isolated write must not appear on the
+promoted primary. Finally, the drill attempts an application write using the old authority head;
+the SQLite epoch fence must reject the stale head before the callback is entered. Cleanup retries
+rule removal in `finally`, while CI always tears down the disposable topology and volumes.
 
 The archived receipt records
 hashes, offsets, the authority epoch and boolean boundary results; it omits Redis/Sentinel endpoints,
@@ -335,16 +344,19 @@ python -m tools.redis_sentinel_election_drill \
   --sentinel-url redis://127.0.0.1:26481/0 \
   --candidate-advertised-host 172.30.0.11 \
   --candidate-advertised-port 6379 \
+  --partition-peer 172.30.0.11 \
+  --partition-peer 172.30.0.21 \
+  --partition-peer 172.30.0.22 \
+  --partition-peer 172.30.0.23 \
   --receipt /tmp/redis-sentinel-election-receipt.json
 docker compose --profile redis-sentinel-election down --volumes
 ```
 
-This proves the repository's corroboration and admission sequence against one real Sentinel election.
-It is not a split-brain test: the former primary is shut down cleanly rather than kept alive behind
-an asymmetric partition. The external epoch fence closes the in-process proof-to-write race, but CI
-does not yet reconnect a stale former primary and attempt a fenced write through it. The topology
-has one promotion candidate, no post-promotion replica
-durability requirement, no ACL/TLS boundary and no Byzantine-fault claim. A stronger next step is to
-keep the former primary alive behind a one-way partition, restore connectivity after promotion, and
-prove its stale authority head cannot enter the fenced write callback.
+This proves the repository's corroboration, healing and stale-head rejection sequence against one
+real Sentinel election and a kernel-enforced one-way egress partition. It is still a single-host
+Docker bridge experiment, not an independent-machine network partition or distributed consensus
+test. The topology has one promotion candidate, no post-promotion replica durability requirement,
+no ACL/TLS boundary and no Byzantine-fault claim. The next step is to repeat the same receipt
+contract across two network namespaces or hosts and inject delayed, reordered traffic during heal.
+
 
