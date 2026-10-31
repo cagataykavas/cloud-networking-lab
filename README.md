@@ -61,7 +61,7 @@ This makes proxy retry/failover behavior visible. The Nginx config uses connecti
 | `docs/sqlite_replay_guard.md` | SQLite transaction, clock rollback and deployment boundaries |
 | `tools/redis_replay_guard.py` | fleet-wide atomic replay claims with token-bound retries and optional replica acknowledgement |
 | `tools/redis_promotion_proof.py` | signed epoch/offset freshness gate for promoted Redis replay traffic |
-| `tools/redis_promotion_authority.py` | versioned hash-chained election/source ledger and proof-issuance boundary |
+| `tools/redis_promotion_authority.py` | hash-chained election ledger, proof issuer and serialized epoch-write fence |
 | `tools/redis_sentinel_promotion.py` | fail-closed live Sentinel election adapter with multi-observer corroboration |
 | `tools/redis_failover_drill.py` | loopback-only stale-replica promotion fault injection with JSON evidence |
 | `tools/redis_sentinel_election_drill.py` | disposable three-Sentinel election and former-primary isolation gate |

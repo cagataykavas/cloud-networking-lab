@@ -99,6 +99,16 @@ def test_ci_runs_three_sentinel_election_and_archives_evidence() -> None:
     assert len(set(uploader)) == 1
 
 
+def test_drill_holds_external_epoch_fence_across_replay_admission() -> None:
+    source = Path("tools/redis_sentinel_election_drill.py").read_text(encoding="utf-8")
+
+    fence = source.index("authority.execute_under_epoch_fence(")
+    proof = source.index("execute_after_promotion_proof(", fence)
+    claim = source.index(").claim(claim_sha256)", proof)
+    assert fence < proof < claim
+    assert '"external_epoch_fence_held_during_admission": True' in source
+
+
 def test_compose_declares_three_independent_sentinel_processes() -> None:
     compose = Path("docker-compose.yml").read_text(encoding="utf-8")
     sentinel = Path("ops/redis-sentinel/sentinel.conf").read_text(encoding="utf-8")

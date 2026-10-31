@@ -9,7 +9,7 @@ import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 from tools.redis_promotion_proof import (
     IDENTIFIER_RE,
@@ -22,6 +22,7 @@ from tools.redis_promotion_proof import (
 
 CURRENT_SCHEMA_VERSION = 2
 LEGACY_SCHEMA_VERSION = 1
+T = TypeVar("T")
 
 
 class PromotionAuthorityError(RuntimeError):
@@ -372,6 +373,46 @@ class SQLitePromotionAuthority:
                 )
                 connection.commit()
                 return proof
+        except PromotionAuthorityError:
+            raise
+        except sqlite3.Error as exc:
+            raise PromotionAuthorityUnavailable(
+                "promotion_authority_unavailable"
+            ) from exc
+
+    def execute_under_epoch_fence(
+        self,
+        *,
+        expected_state_sha256: str,
+        candidate_id: str,
+        operation: Callable[[], T],
+    ) -> tuple[PromotionAuthorityState, T]:
+        """Serialize one bounded write against the exact live authority head.
+
+        The immediate transaction prevents an authority advance from interleaving
+        between the head check and the operation. Callers must keep the operation
+        bounded and must route every protected write through this boundary.
+        """
+
+        expected = _digest(expected_state_sha256, "expected_state_sha256")
+        candidate = _identifier(candidate_id, "candidate_id")
+        if not callable(operation):
+            raise ValueError("operation must be callable")
+        try:
+            with closing(self._connect()) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                current = self._validated_head(connection)
+                if current is None or current.state_sha256 != expected:
+                    raise PromotionAuthorityConflict(
+                        "promotion_authority_head_mismatch"
+                    )
+                if current.candidate_id != candidate:
+                    raise PromotionAuthorityConflict(
+                        "promotion_authority_candidate_mismatch"
+                    )
+                result = operation()
+                connection.commit()
+                return current, result
         except PromotionAuthorityError:
             raise
         except sqlite3.Error as exc:
