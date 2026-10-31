@@ -54,7 +54,7 @@ jobs:
           docker compose --profile redis-sentinel-election up -d --wait
           redis_election_primary redis_election_replica
           redis_election_sentinel_a redis_election_sentinel_b redis_election_sentinel_c
-      - name: Exercise Sentinel election and former-primary isolation
+      - name: Exercise Sentinel election, one-way partition, and healing
         id: sentinel_election_drill
         run: >-
           python -m tools.redis_sentinel_election_drill
@@ -65,6 +65,10 @@ jobs:
           --sentinel-url redis://127.0.0.1:26481/0
           --candidate-advertised-host 172.30.0.11
           --candidate-advertised-port 6379
+          --partition-peer 172.30.0.11
+          --partition-peer 172.30.0.21
+          --partition-peer 172.30.0.22
+          --partition-peer 172.30.0.23
           --receipt "${RUNNER_TEMP}/redis-sentinel-election-receipt.json"
           --timeout-seconds 30
       - name: Archive Sentinel election evidence
@@ -85,3 +89,4 @@ jobs:
         if: always()
         run: docker compose --profile redis-sentinel-election down --volumes
       - run: docker build -t cloud-networking-lab:test .
+

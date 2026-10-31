@@ -64,7 +64,8 @@ This makes proxy retry/failover behavior visible. The Nginx config uses connecti
 | `tools/redis_promotion_authority.py` | hash-chained election ledger, proof issuer and serialized epoch-write fence |
 | `tools/redis_sentinel_promotion.py` | fail-closed live Sentinel election adapter with multi-observer corroboration |
 | `tools/redis_failover_drill.py` | loopback-only stale-replica promotion fault injection with JSON evidence |
-| `tools/redis_sentinel_election_drill.py` | disposable three-Sentinel election and former-primary isolation gate |
+| `tools/docker_egress_partition.py` | bounded iptables controller with verified rollback for one-way peer isolation |
+| `tools/redis_sentinel_election_drill.py` | three-Sentinel one-way partition, healing and stale-head fence drill |
 | `docs/redis_replay_guard.md` | Redis Cluster slotting, same-connection `WAIT`, durability and failover boundaries |
 | `docker-compose.yml` | edge/private network segmentation and service discovery by DNS name |
 
@@ -95,3 +96,4 @@ curl -v http://localhost:8080/whoami
 ## Quality gates
 
 GitHub Actions runs Ruff, pytest, Docker Compose validation and a container build. The project is intentionally small enough to reason about packet flow at a whiteboard but complete enough to reproduce the topology locally.
+

@@ -20,7 +20,11 @@ from urllib.parse import urlsplit
 import redis
 from redis.exceptions import RedisError
 
-from tools.redis_promotion_authority import SQLitePromotionAuthority
+from tools.docker_egress_partition import DockerEgressPartition
+from tools.redis_promotion_authority import (
+    PromotionAuthorityConflict,
+    SQLitePromotionAuthority,
+)
 from tools.redis_promotion_proof import (
     RedisPromotionPolicy,
     RedisReplicationSnapshot,
@@ -64,9 +68,10 @@ def run_election_drill(
     *,
     candidate_advertised_host: str,
     candidate_advertised_port: int,
+    partition: DockerEgressPartition,
     timeout_seconds: float = 20.0,
 ) -> dict[str, Any]:
-    """Stop one primary, corroborate the election, then admit one claim."""
+    """Partition one live primary, corroborate promotion, heal, and fence it."""
 
     validate_election_endpoints(primary_url, candidate_url, sentinel_urls)
     if not 5.0 <= timeout_seconds <= 60.0:
@@ -91,6 +96,7 @@ def run_election_drill(
     }
     run_id = uuid.uuid4().hex
     marker_key = f"redis-sentinel-election:{run_id}:sync"
+    split_brain_key = f"redis-sentinel-election:{run_id}:isolated-write"
     claim_sha256 = hashlib.sha256(f"{run_id}:claim".encode("ascii")).hexdigest()
 
     try:
@@ -113,33 +119,52 @@ def run_election_drill(
             timeout_seconds,
             "candidate did not reach the reviewed replication offset",
         )
-
-        try:
-            primary.execute_command("SHUTDOWN", "NOSAVE")
-        except RedisError:
-            pass
-        _wait_for(
-            lambda: not _can_ping(primary),
-            timeout_seconds,
-            "former primary remained reachable after shutdown",
-        )
-
-        decision = _wait_for_consensus(
-            sentinels,
-            candidate,
-            policy,
-            minimum_replication_offset=offset_floor,
-            timeout_seconds=timeout_seconds,
-        )
-        if _can_ping(primary):
-            raise RuntimeError("former primary became reachable before admission")
-
         with tempfile.TemporaryDirectory() as directory:
             authority = SQLitePromotionAuthority(
                 Path(directory) / "authority.db",
                 "redis-sentinel-election",
             )
-            state = decision.advance(authority, expected_state_sha256=None)
+            former_primary_id = _redis_run_id(primary)
+            former_snapshot = RedisReplicationSnapshot.from_info(
+                primary.info("replication")
+            )
+            former_state = authority.advance(
+                authority_epoch=0,
+                candidate_id=former_primary_id,
+                minimum_replication_offset=offset_floor,
+                snapshot=former_snapshot,
+                source_sha256=hashlib.sha256(
+                    f"pre-partition:{former_primary_id}".encode("ascii")
+                ).hexdigest(),
+                observed_at=int(time.time()),
+                expected_state_sha256=None,
+            )
+
+            partition.isolate()
+            if not _is_reachable_master(primary):
+                raise RuntimeError(
+                    "one-way partition did not preserve former-primary client access"
+                )
+
+            decision = _wait_for_consensus(
+                sentinels,
+                candidate,
+                policy,
+                minimum_replication_offset=offset_floor,
+                timeout_seconds=timeout_seconds,
+            )
+            if not _is_reachable_master(primary):
+                raise RuntimeError("former primary was not alive behind the partition")
+            primary.set(split_brain_key, "former-primary", ex=120)
+            if candidate.get(split_brain_key) is not None:
+                raise RuntimeError(
+                    "isolated former-primary write reached the promoted candidate"
+                )
+
+            state = decision.advance(
+                authority,
+                expected_state_sha256=former_state.state_sha256,
+            )
             secret = secrets.token_bytes(32)
             issued_at = int(time.time())
             proof = authority.issue_proof(
@@ -177,11 +202,47 @@ def run_election_drill(
             if fenced_state != state:
                 raise RuntimeError("epoch fence returned an unexpected authority head")
 
+            partition.heal()
+            _wait_for(
+                lambda: _is_synced_replica(candidate, primary),
+                timeout_seconds,
+                "former primary did not rejoin the promoted candidate as a replica",
+            )
+            if candidate.get(split_brain_key) is not None:
+                raise RuntimeError(
+                    "isolated former-primary write survived topology healing"
+                )
+
+            stale_callback_entered = False
+
+            def stale_write() -> None:
+                nonlocal stale_callback_entered
+                stale_callback_entered = True
+                primary.set(f"{split_brain_key}:stale-callback", "entered", ex=120)
+
+            try:
+                authority.execute_under_epoch_fence(
+                    expected_state_sha256=former_state.state_sha256,
+                    candidate_id=former_state.candidate_id,
+                    operation=stale_write,
+                )
+            except PromotionAuthorityConflict as exc:
+                if str(exc) != "promotion_authority_head_mismatch":
+                    raise
+            else:
+                raise RuntimeError("stale former-primary authority head was accepted")
+            if stale_callback_entered:
+                raise RuntimeError("stale former-primary write callback was entered")
+
         return {
             "boundary": {
                 "authority_advanced_before_admission": True,
+                "connectivity_restored_after_promotion": True,
                 "external_epoch_fence_held_during_admission": True,
-                "former_primary_isolated_before_admission": True,
+                "former_primary_alive_and_writable_during_partition": True,
+                "former_primary_rejoined_as_replica": True,
+                "one_way_egress_partition_applied": True,
+                "stale_authority_head_rejected_after_heal": True,
                 "three_sentinel_views_unanimous": True,
             },
             "observed": {
@@ -190,22 +251,29 @@ def run_election_drill(
                 "candidate_id_sha256": hashlib.sha256(
                     decision.candidate_id.encode("ascii")
                 ).hexdigest(),
+                "former_primary_id_sha256": hashlib.sha256(
+                    former_primary_id.encode("ascii")
+                ).hexdigest(),
                 "minimum_replication_offset": offset_floor,
                 "observer_count": len(sentinels),
+                "pre_failover_authority_head_sha256": former_state.state_sha256,
                 "promotion_proof_sha256": authorization.proof_sha256,
                 "replication_id_sha256": current.replid_sha256,
                 "source_sha256": decision.source_sha256,
             },
             "run_id": run_id,
-            "scenario": "three-sentinel-election-and-old-primary-isolation",
-            "schema_version": 1,
+            "scenario": "three-sentinel-election-one-way-partition-and-heal",
+            "schema_version": 2,
             "status": "pass",
         }
     finally:
-        primary.close()
-        candidate.close()
-        for sentinel in sentinels.values():
-            sentinel.close()
+        try:
+            partition.heal()
+        finally:
+            primary.close()
+            candidate.close()
+            for sentinel in sentinels.values():
+                sentinel.close()
 
 
 def write_receipt(receipt: dict[str, Any], output: Path) -> None:
@@ -298,6 +366,27 @@ def _is_synced_replica(primary: redis.Redis, candidate: redis.Redis) -> bool:
     )
 
 
+def _is_reachable_master(client: redis.Redis) -> bool:
+    try:
+        return client.ping() and client.info("replication").get("role") == "master"
+    except RedisError:
+        return False
+
+
+def _redis_run_id(client: redis.Redis) -> str:
+    try:
+        value = client.info("server").get("run_id")
+    except RedisError as exc:
+        raise RuntimeError("former-primary identity is unavailable") from exc
+    if (
+        not isinstance(value, str)
+        or len(value) != 40
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise RuntimeError("former-primary identity is invalid")
+    return value
+
+
 def _replication_offset(client: redis.Redis) -> int:
     try:
         info = client.info("replication")
@@ -354,6 +443,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--sentinel-url", action="append", required=True)
     parser.add_argument("--candidate-advertised-host", required=True)
     parser.add_argument("--candidate-advertised-port", type=int, required=True)
+    parser.add_argument("--partition-peer", action="append", required=True)
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=float, default=20.0)
     return parser
@@ -369,12 +459,13 @@ def main(argv: list[str] | None = None) -> int:
             args.sentinel_url,
             candidate_advertised_host=args.candidate_advertised_host,
             candidate_advertised_port=args.candidate_advertised_port,
+            partition=DockerEgressPartition(args.partition_peer),
             timeout_seconds=args.timeout_seconds,
         )
     except (OSError, RedisError, RuntimeError, ValueError) as exc:
         receipt = {
             "error": str(exc),
-            "schema_version": 1,
+            "schema_version": 2,
             "started_at": started_at,
             "status": "error",
         }

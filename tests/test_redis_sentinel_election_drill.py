@@ -91,6 +91,7 @@ def test_ci_runs_three_sentinel_election_and_archives_evidence() -> None:
     assert "docker compose --profile redis-sentinel-election up" in workflow
     assert "python -m tools.redis_sentinel_election_drill" in workflow
     assert workflow.count("--sentinel-url redis://127.0.0.1:") == 3
+    assert workflow.count("--partition-peer 172.30.0.") == 4
     assert "steps.sentinel_election_drill.outcome == 'failure'" in workflow
     assert "logs --no-color --tail 200" in workflow
     assert "redis-sentinel-election down --volumes" in workflow
@@ -107,6 +108,13 @@ def test_drill_holds_external_epoch_fence_across_replay_admission() -> None:
     claim = source.index(").claim(claim_sha256)", proof)
     assert fence < proof < claim
     assert '"external_epoch_fence_held_during_admission": True' in source
+    isolate = source.index("partition.isolate()")
+    consensus = source.index("_wait_for_consensus(", isolate)
+    heal = source.index("partition.heal()", consensus)
+    stale_fence = source.index("expected_state_sha256=former_state.state_sha256", heal)
+    stale_callback = source.index("operation=stale_write", stale_fence)
+    assert isolate < consensus < heal < stale_fence < stale_callback
+    assert '"stale_authority_head_rejected_after_heal": True' in source
 
 
 def test_compose_declares_three_independent_sentinel_processes() -> None:
@@ -114,6 +122,9 @@ def test_compose_declares_three_independent_sentinel_processes() -> None:
     sentinel = Path("ops/redis-sentinel/sentinel.conf").read_text(encoding="utf-8")
 
     assert compose.count('profiles: ["redis-sentinel-election"]') == 5
+    assert "dockerfile: ops/redis-sentinel/partition.Dockerfile" in compose
+    assert "- NET_ADMIN" in compose
+    assert "- no-new-privileges:true" in compose
     assert compose.count("exec redis-sentinel /tmp/sentinel.conf") == 3
     assert "127.0.0.1:26479:26379" in compose
     assert "127.0.0.1:26480:26379" in compose
@@ -132,3 +143,13 @@ def test_compose_declares_three_independent_sentinel_processes() -> None:
     assert "sentinel monitor replay-primary 172.30.0.10 6379 2" in sentinel
     assert "resolve-hostnames" not in sentinel
     assert "announce-hostnames" not in sentinel
+
+
+def test_partition_image_contains_only_required_fault_injection_tool() -> None:
+    dockerfile = Path("ops/redis-sentinel/partition.Dockerfile").read_text(
+        encoding="utf-8"
+    )
+
+    assert dockerfile.startswith("FROM redis:8.2.10-alpine\n")
+    assert dockerfile.count("RUN ") == 1
+    assert "apk add --no-cache iptables" in dockerfile

@@ -72,8 +72,14 @@ services:
       - redis_fault_lab
 
   redis_election_primary:
-    image: redis:8.2.10-alpine
+    build:
+      context: .
+      dockerfile: ops/redis-sentinel/partition.Dockerfile
     profiles: ["redis-sentinel-election"]
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
     command: ["redis-server", "--save", "", "--appendonly", "no", "--protected-mode", "no"]
     ports:
       - "127.0.0.1:16479:6379"
@@ -197,3 +203,4 @@ networks:
     ipam:
       config:
         - subnet: 172.30.0.0/24
+
