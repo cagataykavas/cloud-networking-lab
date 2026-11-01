@@ -13,6 +13,15 @@ from typing import Any
 SERVICE = "redis_election_primary"
 HANDLE = "1:"
 CommandRunner = Callable[[list[str], float], str]
+MAX_COUNTER = (1 << 64) - 1
+
+
+@dataclass(frozen=True, slots=True)
+class QdiscTrafficDelta:
+    """Bounded traffic observed through one verified qdisc."""
+
+    packets: int
+    bytes: int
 
 
 def run_command(command: list[str], timeout_seconds: float) -> str:
@@ -49,6 +58,9 @@ class DockerNetemImpairment:
     timeout_seconds: float = 10.0
     runner: CommandRunner = field(default=run_command, repr=False)
     _active: bool = field(default=False, init=False, repr=False)
+    _baseline_counters: tuple[int, int] | None = field(
+        default=None, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         if re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_.-]{0,14}", self.interface) is None:
@@ -75,10 +87,26 @@ class DockerNetemImpairment:
         self.runner(self._tc("add", *self._policy_arguments()), self.timeout_seconds)
         self._active = True
         try:
-            self._verify_live_policy()
+            self._baseline_counters = self._verify_live_policy()
         except BaseException:
             self._clear(suppress_errors=True)
             raise
+
+    def verify_traffic_observed(self) -> QdiscTrafficDelta:
+        """Fail closed unless traffic counters advanced under the live policy."""
+        if not self.active or self._baseline_counters is None:
+            raise RuntimeError("reconnection impairment is not active")
+        current_packets, current_bytes = self._verify_live_policy()
+        baseline_packets, baseline_bytes = self._baseline_counters
+        if current_packets < baseline_packets or current_bytes < baseline_bytes:
+            raise RuntimeError("reconnection impairment counters regressed")
+        delta = QdiscTrafficDelta(
+            packets=current_packets - baseline_packets,
+            bytes=current_bytes - baseline_bytes,
+        )
+        if delta.packets < 1 or delta.bytes < 1:
+            raise RuntimeError("no reconnection traffic traversed the impairment")
+        return delta
 
     def clear(self) -> None:
         """Remove the exact qdisc; a second clear is a safe no-op."""
@@ -91,11 +119,12 @@ class DockerNetemImpairment:
             self.runner(self._tc("del", "root", "handle", HANDLE), self.timeout_seconds)
             self._active = False
             self._verify_absent()
+            self._baseline_counters = None
         except BaseException as exc:
             if not suppress_errors:
                 raise RuntimeError("reconnection impairment cleanup failed") from exc
 
-    def _verify_live_policy(self) -> None:
+    def _verify_live_policy(self) -> tuple[int, int]:
         document = self._qdisc_document()
         matches = [
             entry
@@ -130,6 +159,23 @@ class DockerNetemImpairment:
             for observed, required in expected
         ):
             raise RuntimeError("live reconnection impairment does not match policy")
+        return self._traffic_counters(matches[0])
+
+    @staticmethod
+    def _traffic_counters(entry: dict[str, Any]) -> tuple[int, int]:
+        values: list[int] = []
+        for name in ("packets", "bytes"):
+            value = entry.get(name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 <= value <= MAX_COUNTER
+            ):
+                raise RuntimeError(
+                    f"live reconnection impairment {name} counter is invalid"
+                )
+            values.append(value)
+        return values[0], values[1]
 
     def _verify_absent(self) -> None:
         if any(
@@ -143,7 +189,7 @@ class DockerNetemImpairment:
         raw = self.runner(self._show_command(), self.timeout_seconds)
         try:
             document = json.loads(raw)
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, ValueError) as exc:
             raise RuntimeError("tc returned malformed qdisc evidence") from exc
         if not isinstance(document, list) or len(document) > 16:
             raise RuntimeError("tc returned an invalid qdisc document")
@@ -192,6 +238,7 @@ class DockerNetemImpairment:
             "0",
             SERVICE,
             "tc",
+            "-statistics",
             "-json",
             "qdisc",
             "show",

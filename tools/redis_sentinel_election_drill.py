@@ -215,6 +215,7 @@ def run_election_drill(
                 raise RuntimeError(
                     "isolated former-primary write survived topology healing"
                 )
+            reconnection_traffic = reconnect_impairment.verify_traffic_observed()
             reconnect_impairment.clear()
             if reconnect_impairment.active:
                 raise RuntimeError("reconnection impairment cleanup was not verified")
@@ -250,6 +251,7 @@ def run_election_drill(
                 "one_way_egress_partition_applied": True,
                 "reconnection_delay_and_reordering_applied": True,
                 "reconnection_impairment_removed": True,
+                "reconnection_traffic_traversed_impairment": True,
                 "stale_authority_head_rejected_after_heal": True,
                 "three_sentinel_views_unanimous": True,
             },
@@ -269,12 +271,14 @@ def run_election_drill(
                 "reconnection_delay_ms": reconnect_impairment.delay_ms,
                 "reconnection_jitter_ms": reconnect_impairment.jitter_ms,
                 "reconnection_reorder_percent": reconnect_impairment.reorder_percent,
+                "reconnection_traffic_bytes": reconnection_traffic.bytes,
+                "reconnection_traffic_packets": reconnection_traffic.packets,
                 "replication_id_sha256": current.replid_sha256,
                 "source_sha256": decision.source_sha256,
             },
             "run_id": run_id,
             "scenario": "three-sentinel-election-impaired-partition-heal",
-            "schema_version": 3,
+            "schema_version": 4,
             "status": "pass",
         }
     finally:
@@ -493,7 +497,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, RedisError, RuntimeError, ValueError) as exc:
         receipt = {
             "error": str(exc),
-            "schema_version": 3,
+            "schema_version": 4,
             "started_at": started_at,
             "status": "error",
         }
