@@ -322,13 +322,18 @@ is rejected before the write callback runs. Every protected write path must use 
 does not prevent clients that bypass the application fence from writing directly to Redis. Keep the
 callback bounded because authority advances are serialized until it returns.
 
-After admission, the controller removes every installed drop rule and waits for Sentinel to
-reconfigure the old primary as a synchronized replica. The isolated write must not appear on the
-promoted primary. Finally, the drill attempts an application write using the old authority head;
-the SQLite epoch fence must reject the stale head before the callback is entered. Cleanup retries
-rule removal in `finally`, while CI always tears down the disposable topology and volumes.
+After admission, the controller installs one root `tc netem` qdisc on the former primary before it
+removes the drop rules. The first reconnection traffic is therefore subject to a bounded 200 ms
+delay, 20 ms jitter, 25% reordering and 50% reordering correlation. The controller reads the live
+qdisc back as bounded JSON and requires the exact handle and policy before healing can continue.
+Sentinel must reconfigure the old primary as a synchronized replica under that impairment, and the
+isolated write must not appear on the promoted primary. The controller then removes the exact qdisc
+and verifies it is absent before attempting an application write using the old authority head; the
+SQLite epoch fence must reject the stale head before the callback is entered. Cleanup retries both
+qdisc and drop-rule removal in `finally`, while CI always tears down the disposable topology and
+volumes.
 
-The archived receipt records
+The schema-v3 archived receipt records
 hashes, offsets, the authority epoch and boolean boundary results; it omits Redis/Sentinel endpoints,
 raw run IDs, raw replication IDs, proof keys and replay tokens.
 
@@ -348,6 +353,11 @@ python -m tools.redis_sentinel_election_drill \
   --partition-peer 172.30.0.21 \
   --partition-peer 172.30.0.22 \
   --partition-peer 172.30.0.23 \
+  --reconnect-interface eth0 \
+  --reconnect-delay-ms 200 \
+  --reconnect-jitter-ms 20 \
+  --reconnect-reorder-percent 25 \
+  --reconnect-reorder-correlation-percent 50 \
   --receipt /tmp/redis-sentinel-election-receipt.json
 docker compose --profile redis-sentinel-election down --volumes
 ```
@@ -356,7 +366,9 @@ This proves the repository's corroboration, healing and stale-head rejection seq
 real Sentinel election and a kernel-enforced one-way egress partition. It is still a single-host
 Docker bridge experiment, not an independent-machine network partition or distributed consensus
 test. The topology has one promotion candidate, no post-promotion replica durability requirement,
-no ACL/TLS boundary and no Byzantine-fault claim. The next step is to repeat the same receipt
-contract across two network namespaces or hosts and inject delayed, reordered traffic during heal.
+no ACL/TLS boundary and no Byzantine-fault claim. Netem's reordering is a controlled kernel model,
+not a WAN trace or proof that a particular packet was reordered. The next step is to repeat the same
+receipt contract across two hosts and retain the authority head in an independent strongly
+consistent control plane.
 
 

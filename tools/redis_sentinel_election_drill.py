@@ -21,6 +21,7 @@ import redis
 from redis.exceptions import RedisError
 
 from tools.docker_egress_partition import DockerEgressPartition
+from tools.docker_netem_impairment import DockerNetemImpairment
 from tools.redis_promotion_authority import (
     PromotionAuthorityConflict,
     SQLitePromotionAuthority,
@@ -69,6 +70,7 @@ def run_election_drill(
     candidate_advertised_host: str,
     candidate_advertised_port: int,
     partition: DockerEgressPartition,
+    reconnect_impairment: DockerNetemImpairment,
     timeout_seconds: float = 20.0,
 ) -> dict[str, Any]:
     """Partition one live primary, corroborate promotion, heal, and fence it."""
@@ -202,16 +204,20 @@ def run_election_drill(
             if fenced_state != state:
                 raise RuntimeError("epoch fence returned an unexpected authority head")
 
+            reconnect_impairment.apply()
             partition.heal()
             _wait_for(
                 lambda: _is_synced_replica(candidate, primary),
                 timeout_seconds,
-                "former primary did not rejoin the promoted candidate as a replica",
+                "former primary did not rejoin under impaired reconnection",
             )
             if candidate.get(split_brain_key) is not None:
                 raise RuntimeError(
                     "isolated former-primary write survived topology healing"
                 )
+            reconnect_impairment.clear()
+            if reconnect_impairment.active:
+                raise RuntimeError("reconnection impairment cleanup was not verified")
 
             stale_callback_entered = False
 
@@ -242,6 +248,8 @@ def run_election_drill(
                 "former_primary_alive_and_writable_during_partition": True,
                 "former_primary_rejoined_as_replica": True,
                 "one_way_egress_partition_applied": True,
+                "reconnection_delay_and_reordering_applied": True,
+                "reconnection_impairment_removed": True,
                 "stale_authority_head_rejected_after_heal": True,
                 "three_sentinel_views_unanimous": True,
             },
@@ -258,22 +266,28 @@ def run_election_drill(
                 "observer_count": len(sentinels),
                 "pre_failover_authority_head_sha256": former_state.state_sha256,
                 "promotion_proof_sha256": authorization.proof_sha256,
+                "reconnection_delay_ms": reconnect_impairment.delay_ms,
+                "reconnection_jitter_ms": reconnect_impairment.jitter_ms,
+                "reconnection_reorder_percent": reconnect_impairment.reorder_percent,
                 "replication_id_sha256": current.replid_sha256,
                 "source_sha256": decision.source_sha256,
             },
             "run_id": run_id,
-            "scenario": "three-sentinel-election-one-way-partition-and-heal",
-            "schema_version": 2,
+            "scenario": "three-sentinel-election-impaired-partition-heal",
+            "schema_version": 3,
             "status": "pass",
         }
     finally:
         try:
-            partition.heal()
+            reconnect_impairment.clear()
         finally:
-            primary.close()
-            candidate.close()
-            for sentinel in sentinels.values():
-                sentinel.close()
+            try:
+                partition.heal()
+            finally:
+                primary.close()
+                candidate.close()
+                for sentinel in sentinels.values():
+                    sentinel.close()
 
 
 def write_receipt(receipt: dict[str, Any], output: Path) -> None:
@@ -444,6 +458,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--candidate-advertised-host", required=True)
     parser.add_argument("--candidate-advertised-port", type=int, required=True)
     parser.add_argument("--partition-peer", action="append", required=True)
+    parser.add_argument("--reconnect-interface", default="eth0")
+    parser.add_argument("--reconnect-delay-ms", type=int, default=200)
+    parser.add_argument("--reconnect-jitter-ms", type=int, default=20)
+    parser.add_argument("--reconnect-reorder-percent", type=int, default=25)
+    parser.add_argument("--reconnect-reorder-correlation-percent", type=int, default=50)
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=float, default=20.0)
     return parser
@@ -460,12 +479,21 @@ def main(argv: list[str] | None = None) -> int:
             candidate_advertised_host=args.candidate_advertised_host,
             candidate_advertised_port=args.candidate_advertised_port,
             partition=DockerEgressPartition(args.partition_peer),
+            reconnect_impairment=DockerNetemImpairment(
+                interface=args.reconnect_interface,
+                delay_ms=args.reconnect_delay_ms,
+                jitter_ms=args.reconnect_jitter_ms,
+                reorder_percent=args.reconnect_reorder_percent,
+                reorder_correlation_percent=(
+                    args.reconnect_reorder_correlation_percent
+                ),
+            ),
             timeout_seconds=args.timeout_seconds,
         )
     except (OSError, RedisError, RuntimeError, ValueError) as exc:
         receipt = {
             "error": str(exc),
-            "schema_version": 2,
+            "schema_version": 3,
             "started_at": started_at,
             "status": "error",
         }

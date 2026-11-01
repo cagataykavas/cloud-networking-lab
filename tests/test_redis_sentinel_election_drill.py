@@ -92,6 +92,11 @@ def test_ci_runs_three_sentinel_election_and_archives_evidence() -> None:
     assert "python -m tools.redis_sentinel_election_drill" in workflow
     assert workflow.count("--sentinel-url redis://127.0.0.1:") == 3
     assert workflow.count("--partition-peer 172.30.0.") == 4
+    assert "--reconnect-interface eth0" in workflow
+    assert "--reconnect-delay-ms 200" in workflow
+    assert "--reconnect-jitter-ms 20" in workflow
+    assert "--reconnect-reorder-percent 25" in workflow
+    assert "--reconnect-reorder-correlation-percent 50" in workflow
     assert "steps.sentinel_election_drill.outcome == 'failure'" in workflow
     assert "logs --no-color --tail 200" in workflow
     assert "redis-sentinel-election down --volumes" in workflow
@@ -110,10 +115,17 @@ def test_drill_holds_external_epoch_fence_across_replay_admission() -> None:
     assert '"external_epoch_fence_held_during_admission": True' in source
     isolate = source.index("partition.isolate()")
     consensus = source.index("_wait_for_consensus(", isolate)
+    impair = source.index("reconnect_impairment.apply()", consensus)
     heal = source.index("partition.heal()", consensus)
+    rejoined = source.index("former primary did not rejoin under impaired reconnection")
+    clear = source.index("reconnect_impairment.clear()", rejoined)
     stale_fence = source.index("expected_state_sha256=former_state.state_sha256", heal)
     stale_callback = source.index("operation=stale_write", stale_fence)
-    assert isolate < consensus < heal < stale_fence < stale_callback
+    assert isolate < consensus < impair < heal < rejoined < clear < stale_fence
+    assert stale_fence < stale_callback
+    assert '"reconnection_delay_and_reordering_applied": True' in source
+    assert '"reconnection_impairment_removed": True' in source
+    assert '"schema_version": 3' in source
     assert '"stale_authority_head_rejected_after_heal": True' in source
 
 
@@ -145,11 +157,11 @@ def test_compose_declares_three_independent_sentinel_processes() -> None:
     assert "announce-hostnames" not in sentinel
 
 
-def test_partition_image_contains_only_required_fault_injection_tool() -> None:
+def test_partition_image_contains_only_required_fault_injection_tools() -> None:
     dockerfile = Path("ops/redis-sentinel/partition.Dockerfile").read_text(
         encoding="utf-8"
     )
 
     assert dockerfile.startswith("FROM redis:8.2.10-alpine\n")
     assert dockerfile.count("RUN ") == 1
-    assert "apk add --no-cache iptables" in dockerfile
+    assert "apk add --no-cache iproute2 iptables" in dockerfile
