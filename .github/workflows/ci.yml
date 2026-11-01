@@ -69,6 +69,11 @@ jobs:
           --partition-peer 172.30.0.21
           --partition-peer 172.30.0.22
           --partition-peer 172.30.0.23
+          --reconnect-interface eth0
+          --reconnect-delay-ms 200
+          --reconnect-jitter-ms 20
+          --reconnect-reorder-percent 25
+          --reconnect-reorder-correlation-percent 50
           --receipt "${RUNNER_TEMP}/redis-sentinel-election-receipt.json"
           --timeout-seconds 30
       - name: Archive Sentinel election evidence

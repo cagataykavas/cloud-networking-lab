@@ -65,7 +65,8 @@ This makes proxy retry/failover behavior visible. The Nginx config uses connecti
 | `tools/redis_sentinel_promotion.py` | fail-closed live Sentinel election adapter with multi-observer corroboration |
 | `tools/redis_failover_drill.py` | loopback-only stale-replica promotion fault injection with JSON evidence |
 | `tools/docker_egress_partition.py` | bounded iptables controller with verified rollback for one-way peer isolation |
-| `tools/redis_sentinel_election_drill.py` | three-Sentinel one-way partition, healing and stale-head fence drill |
+| `tools/docker_netem_impairment.py` | verified delay/reordering policy and cleanup for impaired reconnection |
+| `tools/redis_sentinel_election_drill.py` | three-Sentinel partition, impaired healing and stale-head fence drill |
 | `docs/redis_replay_guard.md` | Redis Cluster slotting, same-connection `WAIT`, durability and failover boundaries |
 | `docker-compose.yml` | edge/private network segmentation and service discovery by DNS name |
 
