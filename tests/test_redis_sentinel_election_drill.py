@@ -115,23 +115,41 @@ def test_drill_holds_external_epoch_fence_across_replay_admission() -> None:
     assert '"external_epoch_fence_held_during_admission": True' in source
     isolate = source.index("partition.isolate()")
     consensus = source.index("_wait_for_consensus(", isolate)
-    impair = source.index("reconnect_impairment.apply()", consensus)
+    baseline = source.index("baseline_latency = observe_round_trip_latency", consensus)
+    impair = source.index("reconnect_impairment.apply()", baseline)
     heal = source.index("partition.heal()", consensus)
     rejoined = source.index("former primary did not rejoin under impaired reconnection")
+    impaired = source.index("impaired_latency = observe_round_trip_latency", rejoined)
     traffic = source.index("reconnect_impairment.verify_traffic_observed()", rejoined)
     clear = source.index("reconnect_impairment.clear()", rejoined)
+    recovery = source.index("recovery_latency = observe_round_trip_latency", clear)
+    latency = source.index("latency_evidence = verify_latency_shift", recovery)
     stale_fence = source.index("expected_state_sha256=former_state.state_sha256", heal)
     stale_callback = source.index("operation=stale_write", stale_fence)
     assert (
-        isolate < consensus < impair < heal < rejoined < traffic < clear < stale_fence
+        isolate
+        < consensus
+        < baseline
+        < impair
+        < heal
+        < rejoined
+        < impaired
+        < traffic
+        < clear
+        < recovery
+        < latency
+        < stale_fence
     )
     assert stale_fence < stale_callback
     assert '"reconnection_delay_and_reordering_applied": True' in source
     assert '"reconnection_impairment_removed": True' in source
+    assert '"reconnection_latency_recovered": True' in source
+    assert '"reconnection_latency_shift_observed": True' in source
+    assert '"reconnection_latency": latency_evidence.as_dict()' in source
     assert '"reconnection_traffic_traversed_impairment": True' in source
     assert '"reconnection_traffic_bytes": reconnection_traffic.bytes' in source
     assert '"reconnection_traffic_packets": reconnection_traffic.packets' in source
-    assert '"schema_version": 4' in source
+    assert '"schema_version": 5' in source
     assert '"stale_authority_head_rejected_after_heal": True' in source
 
 

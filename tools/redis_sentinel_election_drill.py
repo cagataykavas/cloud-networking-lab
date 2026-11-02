@@ -22,6 +22,10 @@ from redis.exceptions import RedisError
 
 from tools.docker_egress_partition import DockerEgressPartition
 from tools.docker_netem_impairment import DockerNetemImpairment
+from tools.network_latency_evidence import (
+    observe_round_trip_latency,
+    verify_latency_shift,
+)
 from tools.redis_promotion_authority import (
     PromotionAuthorityConflict,
     SQLitePromotionAuthority,
@@ -204,6 +208,7 @@ def run_election_drill(
             if fenced_state != state:
                 raise RuntimeError("epoch fence returned an unexpected authority head")
 
+            baseline_latency = observe_round_trip_latency(primary.ping)
             reconnect_impairment.apply()
             partition.heal()
             _wait_for(
@@ -215,10 +220,19 @@ def run_election_drill(
                 raise RuntimeError(
                     "isolated former-primary write survived topology healing"
                 )
+            impaired_latency = observe_round_trip_latency(primary.ping)
             reconnection_traffic = reconnect_impairment.verify_traffic_observed()
             reconnect_impairment.clear()
             if reconnect_impairment.active:
                 raise RuntimeError("reconnection impairment cleanup was not verified")
+            recovery_latency = observe_round_trip_latency(primary.ping)
+            latency_evidence = verify_latency_shift(
+                baseline_latency,
+                impaired_latency,
+                recovery_latency,
+                configured_delay_ms=reconnect_impairment.delay_ms,
+                configured_jitter_ms=reconnect_impairment.jitter_ms,
+            )
 
             stale_callback_entered = False
 
@@ -251,6 +265,8 @@ def run_election_drill(
                 "one_way_egress_partition_applied": True,
                 "reconnection_delay_and_reordering_applied": True,
                 "reconnection_impairment_removed": True,
+                "reconnection_latency_recovered": True,
+                "reconnection_latency_shift_observed": True,
                 "reconnection_traffic_traversed_impairment": True,
                 "stale_authority_head_rejected_after_heal": True,
                 "three_sentinel_views_unanimous": True,
@@ -270,6 +286,7 @@ def run_election_drill(
                 "promotion_proof_sha256": authorization.proof_sha256,
                 "reconnection_delay_ms": reconnect_impairment.delay_ms,
                 "reconnection_jitter_ms": reconnect_impairment.jitter_ms,
+                "reconnection_latency": latency_evidence.as_dict(),
                 "reconnection_reorder_percent": reconnect_impairment.reorder_percent,
                 "reconnection_traffic_bytes": reconnection_traffic.bytes,
                 "reconnection_traffic_packets": reconnection_traffic.packets,
@@ -278,7 +295,7 @@ def run_election_drill(
             },
             "run_id": run_id,
             "scenario": "three-sentinel-election-impaired-partition-heal",
-            "schema_version": 4,
+            "schema_version": 5,
             "status": "pass",
         }
     finally:
@@ -497,7 +514,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, RedisError, RuntimeError, ValueError) as exc:
         receipt = {
             "error": str(exc),
-            "schema_version": 4,
+            "schema_version": 5,
             "started_at": started_at,
             "status": "error",
         }
