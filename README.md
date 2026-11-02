@@ -66,6 +66,7 @@ This makes proxy retry/failover behavior visible. The Nginx config uses connecti
 | `tools/redis_failover_drill.py` | loopback-only stale-replica promotion fault injection with JSON evidence |
 | `tools/docker_egress_partition.py` | bounded iptables controller with verified rollback for one-way peer isolation |
 | `tools/docker_netem_impairment.py` | verified delay/reordering policy, traffic-counter proof and cleanup for impaired reconnection |
+| `tools/network_latency_evidence.py` | bounded baseline/impairment/recovery RTT evidence with aggregate-only receipts |
 | `tools/redis_sentinel_election_drill.py` | three-Sentinel partition, impaired healing and stale-head fence drill |
 | `docs/redis_replay_guard.md` | Redis Cluster slotting, same-connection `WAIT`, durability and failover boundaries |
 | `docker-compose.yml` | edge/private network segmentation and service discovery by DNS name |
@@ -96,5 +97,6 @@ curl -v http://localhost:8080/whoami
 
 ## Quality gates
 
-GitHub Actions runs Ruff, pytest, Docker Compose validation, a live three-Sentinel healing drill and a container build. The drill fails closed unless qdisc packet and byte counters prove that reconnection traffic crossed the active impairment. The project is intentionally small enough to reason about packet flow at a whiteboard but complete enough to reproduce the topology locally.
+GitHub Actions runs Ruff, pytest, Docker Compose validation, a live three-Sentinel healing drill and a container build. The drill fails closed unless qdisc counters prove traffic crossed the active impairment, the configured delay is visible in aggregate round-trip latency, and latency returns to a bounded baseline band after cleanup. Raw probe timings, endpoints and payloads are not retained. The project is intentionally small enough to reason about packet flow at a whiteboard but complete enough to reproduce the topology locally.
+
 
