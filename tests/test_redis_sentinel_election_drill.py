@@ -146,10 +146,15 @@ def test_drill_holds_external_epoch_fence_across_replay_admission() -> None:
     assert '"reconnection_latency_recovered": True' in source
     assert '"reconnection_latency_shift_observed": True' in source
     assert '"reconnection_latency": latency_evidence.as_dict()' in source
+    assert '"reconnection_qdisc_pressure_counters_collected": True' in source
     assert '"reconnection_traffic_traversed_impairment": True' in source
     assert '"reconnection_traffic_bytes": reconnection_traffic.bytes' in source
+    assert '"reconnection_traffic_drops": reconnection_traffic.drops' in source
+    assert (
+        '"reconnection_traffic_overlimits": reconnection_traffic.overlimits' in source
+    )
     assert '"reconnection_traffic_packets": reconnection_traffic.packets' in source
-    assert '"schema_version": 5' in source
+    assert '"schema_version": 6' in source
     assert '"stale_authority_head_rejected_after_heal": True' in source
 
 
