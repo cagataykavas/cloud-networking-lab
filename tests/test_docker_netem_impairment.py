@@ -7,6 +7,7 @@ import pytest
 
 from tools.docker_netem_impairment import (
     HANDLE,
+    MAX_COUNTER,
     SERVICE,
     DockerNetemImpairment,
     QdiscTrafficDelta,
@@ -22,6 +23,8 @@ def qdisc_document(
     correlation: float = 0.5,
     packets: int = 0,
     bytes_: int = 0,
+    drops: int = 0,
+    overlimits: int = 0,
 ) -> str:
     return json.dumps(
         [
@@ -31,6 +34,8 @@ def qdisc_document(
                 "root": True,
                 "packets": packets,
                 "bytes": bytes_,
+                "drops": drops,
+                "overlimits": overlimits,
                 "options": {
                     "limit": 1_000,
                     "delay": {"delay": delay, "jitter": jitter, "correlation": 0},
@@ -128,8 +133,8 @@ def test_applies_verifies_and_removes_exact_netem_policy() -> None:
 def test_proves_traffic_crossed_the_verified_impairment() -> None:
     runner = RecordingRunner(
         show_documents=[
-            qdisc_document(packets=10, bytes_=900),
-            qdisc_document(packets=14, bytes_=1_600),
+            qdisc_document(packets=10, bytes_=900, drops=2, overlimits=3),
+            qdisc_document(packets=14, bytes_=1_600, drops=5, overlimits=7),
             "[]",
         ]
     )
@@ -139,6 +144,8 @@ def test_proves_traffic_crossed_the_verified_impairment() -> None:
     assert impairment.verify_traffic_observed() == QdiscTrafficDelta(
         packets=4,
         bytes=700,
+        drops=3,
+        overlimits=4,
     )
     impairment.clear()
 
@@ -167,11 +174,37 @@ def test_rejects_absent_or_regressing_traffic(
 
 
 @pytest.mark.parametrize(
+    "current",
+    [
+        qdisc_document(packets=11, bytes_=901, drops=4, overlimits=7),
+        qdisc_document(packets=11, bytes_=901, drops=5, overlimits=6),
+    ],
+)
+def test_rejects_regressing_drop_or_overlimit_counters(current: str) -> None:
+    runner = RecordingRunner(
+        show_documents=[
+            qdisc_document(packets=10, bytes_=900, drops=5, overlimits=7),
+            current,
+            "[]",
+        ]
+    )
+    impairment = DockerNetemImpairment(runner=runner)
+    impairment.apply()
+
+    with pytest.raises(RuntimeError, match="counters regressed"):
+        impairment.verify_traffic_observed()
+
+    impairment.clear()
+
+
+@pytest.mark.parametrize(
     "counter_overrides",
     [
         {"packets": True},
         {"packets": -1},
         {"bytes_": -1},
+        {"drops": True},
+        {"overlimits": MAX_COUNTER + 1},
     ],
 )
 def test_rejects_invalid_live_counters(counter_overrides: dict[str, object]) -> None:

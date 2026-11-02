@@ -18,10 +18,12 @@ MAX_COUNTER = (1 << 64) - 1
 
 @dataclass(frozen=True, slots=True)
 class QdiscTrafficDelta:
-    """Bounded traffic observed through one verified qdisc."""
+    """Bounded traffic and queue-pressure deltas from one verified qdisc."""
 
     packets: int
     bytes: int
+    drops: int
+    overlimits: int
 
 
 def run_command(command: list[str], timeout_seconds: float) -> str:
@@ -58,7 +60,7 @@ class DockerNetemImpairment:
     timeout_seconds: float = 10.0
     runner: CommandRunner = field(default=run_command, repr=False)
     _active: bool = field(default=False, init=False, repr=False)
-    _baseline_counters: tuple[int, int] | None = field(
+    _baseline_counters: tuple[int, int, int, int] | None = field(
         default=None, init=False, repr=False
     )
 
@@ -96,13 +98,18 @@ class DockerNetemImpairment:
         """Fail closed unless traffic counters advanced under the live policy."""
         if not self.active or self._baseline_counters is None:
             raise RuntimeError("reconnection impairment is not active")
-        current_packets, current_bytes = self._verify_live_policy()
-        baseline_packets, baseline_bytes = self._baseline_counters
-        if current_packets < baseline_packets or current_bytes < baseline_bytes:
+        current = self._verify_live_policy()
+        baseline = self._baseline_counters
+        if any(
+            observed < initial
+            for observed, initial in zip(current, baseline, strict=True)
+        ):
             raise RuntimeError("reconnection impairment counters regressed")
         delta = QdiscTrafficDelta(
-            packets=current_packets - baseline_packets,
-            bytes=current_bytes - baseline_bytes,
+            packets=current[0] - baseline[0],
+            bytes=current[1] - baseline[1],
+            drops=current[2] - baseline[2],
+            overlimits=current[3] - baseline[3],
         )
         if delta.packets < 1 or delta.bytes < 1:
             raise RuntimeError("no reconnection traffic traversed the impairment")
@@ -124,7 +131,7 @@ class DockerNetemImpairment:
             if not suppress_errors:
                 raise RuntimeError("reconnection impairment cleanup failed") from exc
 
-    def _verify_live_policy(self) -> tuple[int, int]:
+    def _verify_live_policy(self) -> tuple[int, int, int, int]:
         document = self._qdisc_document()
         matches = [
             entry
@@ -162,9 +169,9 @@ class DockerNetemImpairment:
         return self._traffic_counters(matches[0])
 
     @staticmethod
-    def _traffic_counters(entry: dict[str, Any]) -> tuple[int, int]:
+    def _traffic_counters(entry: dict[str, Any]) -> tuple[int, int, int, int]:
         values: list[int] = []
-        for name in ("packets", "bytes"):
+        for name in ("packets", "bytes", "drops", "overlimits"):
             value = entry.get(name)
             if (
                 isinstance(value, bool)
@@ -175,7 +182,7 @@ class DockerNetemImpairment:
                     f"live reconnection impairment {name} counter is invalid"
                 )
             values.append(value)
-        return values[0], values[1]
+        return values[0], values[1], values[2], values[3]
 
     def _verify_absent(self) -> None:
         if any(
