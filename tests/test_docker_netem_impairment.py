@@ -21,11 +21,24 @@ def qdisc_document(
     jitter: float = 0.02,
     reorder: float = 0.25,
     correlation: float = 0.5,
+    loss: float | None = None,
     packets: int = 0,
     bytes_: int = 0,
     drops: int = 0,
     overlimits: int = 0,
 ) -> str:
+    options: dict[str, object] = {
+        "limit": 1_000,
+        "delay": {"delay": delay, "jitter": jitter, "correlation": 0},
+        "gap": 1,
+    }
+    if reorder:
+        options["reorder"] = {
+            "reorder": reorder,
+            "correlation": correlation,
+        }
+    if loss is not None:
+        options["loss-random"] = {"loss": loss, "correlation": 0}
     return json.dumps(
         [
             {
@@ -36,15 +49,7 @@ def qdisc_document(
                 "bytes": bytes_,
                 "drops": drops,
                 "overlimits": overlimits,
-                "options": {
-                    "limit": 1_000,
-                    "delay": {"delay": delay, "jitter": jitter, "correlation": 0},
-                    "reorder": {
-                        "reorder": reorder,
-                        "correlation": correlation,
-                    },
-                    "gap": 1,
-                },
+                "options": options,
             }
         ]
     )
@@ -148,6 +153,131 @@ def test_proves_traffic_crossed_the_verified_impairment() -> None:
         overlimits=4,
     )
     impairment.clear()
+
+
+def test_requires_nonzero_drop_evidence_for_explicit_loss_policy() -> None:
+    runner = RecordingRunner(
+        show_documents=[
+            qdisc_document(
+                reorder=0,
+                correlation=0,
+                loss=1.0,
+                packets=10,
+                bytes_=900,
+            ),
+            qdisc_document(
+                reorder=0,
+                correlation=0,
+                loss=1.0,
+                packets=10,
+                bytes_=900,
+                drops=3,
+            ),
+            "[]",
+        ]
+    )
+    impairment = DockerNetemImpairment(
+        reorder_percent=0,
+        reorder_correlation_percent=0,
+        loss_percent=100,
+        runner=runner,
+    )
+
+    impairment.apply()
+    assert (
+        impairment.verify_traffic_observed(require_drops=True, minimum_packets=3).drops
+        == 3
+    )
+    impairment.clear()
+
+    assert runner.commands[0][0][-3:] == ["loss", "random", "100%"]
+
+
+def test_rejects_zero_drop_evidence_for_explicit_loss_policy() -> None:
+    runner = RecordingRunner(
+        show_documents=[
+            qdisc_document(reorder=0, correlation=0, loss=1.0),
+            qdisc_document(
+                reorder=0,
+                correlation=0,
+                loss=1.0,
+                packets=1,
+                bytes_=100,
+            ),
+            "[]",
+        ]
+    )
+    impairment = DockerNetemImpairment(
+        reorder_percent=0,
+        reorder_correlation_percent=0,
+        loss_percent=100,
+        runner=runner,
+    )
+    impairment.apply()
+
+    with pytest.raises(RuntimeError, match="no packet drops"):
+        impairment.verify_traffic_observed(require_drops=True)
+
+    impairment.clear()
+
+
+def test_rejects_insufficient_loss_probe_volume() -> None:
+    runner = RecordingRunner(
+        show_documents=[
+            qdisc_document(reorder=0, correlation=0, loss=1.0),
+            qdisc_document(reorder=0, correlation=0, loss=1.0, drops=1),
+            "[]",
+        ]
+    )
+    impairment = DockerNetemImpairment(
+        reorder_percent=0,
+        reorder_correlation_percent=0,
+        loss_percent=100,
+        runner=runner,
+    )
+    impairment.apply()
+
+    with pytest.raises(RuntimeError, match="insufficient traffic"):
+        impairment.verify_traffic_observed(require_drops=True, minimum_packets=3)
+
+    impairment.clear()
+
+
+def test_drop_gate_requires_a_loss_policy() -> None:
+    impairment = DockerNetemImpairment(runner=RecordingRunner())
+    impairment.apply()
+
+    with pytest.raises(RuntimeError, match="requires a configured loss policy"):
+        impairment.verify_traffic_observed(require_drops=True)
+
+    impairment.clear()
+
+
+def test_enforces_bounded_minimum_packet_volume() -> None:
+    runner = RecordingRunner(
+        show_documents=[
+            qdisc_document(packets=10, bytes_=900),
+            qdisc_document(packets=11, bytes_=1_000),
+            "[]",
+        ]
+    )
+    impairment = DockerNetemImpairment(runner=runner)
+    impairment.apply()
+
+    with pytest.raises(RuntimeError, match="no reconnection traffic"):
+        impairment.verify_traffic_observed(minimum_packets=2)
+
+    impairment.clear()
+
+
+@pytest.mark.parametrize("minimum_packets", [True, 0, 1_001, 1.5])
+def test_rejects_invalid_minimum_packet_volume(minimum_packets: object) -> None:
+    impairment = DockerNetemImpairment(runner=RecordingRunner())
+
+    with pytest.raises(ValueError, match="minimum_packets"):
+        impairment.verify_traffic_observed(  # type: ignore[arg-type]
+            minimum_packets=minimum_packets
+        )
 
 
 @pytest.mark.parametrize(
@@ -258,7 +388,10 @@ def test_failed_cleanup_remains_active_for_retry() -> None:
         {"delay_ms": 20, "jitter_ms": 21},
         {"reorder_percent": 0},
         {"reorder_percent": 51},
+        {"reorder_percent": 0, "reorder_correlation_percent": 1},
         {"reorder_correlation_percent": 101},
+        {"loss_percent": -1},
+        {"loss_percent": 101},
         {"timeout_seconds": 31},
     ],
 )
