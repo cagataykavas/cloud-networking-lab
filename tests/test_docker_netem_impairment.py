@@ -22,6 +22,7 @@ def qdisc_document(
     reorder: float = 0.25,
     correlation: float = 0.5,
     loss: float | None = None,
+    seed: int | None = None,
     packets: int = 0,
     bytes_: int = 0,
     drops: int = 0,
@@ -39,6 +40,8 @@ def qdisc_document(
         }
     if loss is not None:
         options["loss-random"] = {"loss": loss, "correlation": 0}
+    if seed is not None:
+        options["seed"] = seed
     return json.dumps(
         [
             {
@@ -191,6 +194,75 @@ def test_requires_nonzero_drop_evidence_for_explicit_loss_policy() -> None:
     impairment.clear()
 
     assert runner.commands[0][0][-3:] == ["loss", "random", "100%"]
+
+
+def test_applies_and_verifies_seeded_partial_loss_policy() -> None:
+    runner = RecordingRunner(
+        show_documents=[
+            qdisc_document(
+                delay=0.01,
+                jitter=0.0,
+                reorder=0,
+                correlation=0,
+                loss=0.2,
+                seed=12_648_430,
+            ),
+            "[]",
+        ]
+    )
+    impairment = DockerNetemImpairment(
+        delay_ms=10,
+        jitter_ms=0,
+        reorder_percent=0,
+        reorder_correlation_percent=0,
+        loss_percent=20,
+        seed=12_648_430,
+        runner=runner,
+    )
+
+    impairment.apply()
+    impairment.clear()
+
+    assert runner.commands[0][0][-5:] == [
+        "loss",
+        "random",
+        "20%",
+        "seed",
+        "12648430",
+    ]
+
+
+def test_accepts_kernel_generated_seed_when_policy_does_not_pin_one() -> None:
+    impairment = DockerNetemImpairment(
+        runner=RecordingRunner(live_document=qdisc_document(seed=98_765))
+    )
+
+    impairment.apply()
+    impairment.clear()
+
+
+@pytest.mark.parametrize("observed_seed", [None, 12_648_431, True])
+def test_rejects_missing_or_mismatched_live_seed(observed_seed: object) -> None:
+    runner = RecordingRunner(
+        live_document=qdisc_document(
+            reorder=0,
+            correlation=0,
+            loss=0.2,
+            seed=observed_seed,  # type: ignore[arg-type]
+        )
+    )
+    impairment = DockerNetemImpairment(
+        reorder_percent=0,
+        reorder_correlation_percent=0,
+        loss_percent=20,
+        seed=12_648_430,
+        runner=runner,
+    )
+
+    with pytest.raises(RuntimeError, match="seed does not match"):
+        impairment.apply()
+
+    assert not impairment.active
 
 
 def test_rejects_zero_drop_evidence_for_explicit_loss_policy() -> None:
@@ -392,6 +464,10 @@ def test_failed_cleanup_remains_active_for_retry() -> None:
         {"reorder_correlation_percent": 101},
         {"loss_percent": -1},
         {"loss_percent": 101},
+        {"seed": 1},
+        {"loss_percent": 20, "seed": True},
+        {"loss_percent": 20, "seed": 0},
+        {"loss_percent": 20, "seed": MAX_COUNTER + 1},
         {"timeout_seconds": 31},
     ],
 )

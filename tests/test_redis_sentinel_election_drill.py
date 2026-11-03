@@ -98,6 +98,9 @@ def test_ci_runs_three_sentinel_election_and_archives_evidence() -> None:
     assert "--reconnect-reorder-percent 25" in workflow
     assert "--reconnect-reorder-correlation-percent 50" in workflow
     assert "--loss-probe-percent 100" in workflow
+    assert "--partial-loss-percent 20" in workflow
+    assert "--partial-loss-seed 12648430" in workflow
+    assert "--partial-loss-attempts 128" in workflow
     assert "steps.sentinel_election_drill.outcome == 'failure'" in workflow
     assert "logs --no-color --tail 200" in workflow
     assert "redis-sentinel-election down --volumes" in workflow
@@ -132,6 +135,19 @@ def test_drill_holds_external_epoch_fence_across_replay_admission() -> None:
     )
     drop_clear = source.index("drop_probe_impairment.clear()", drop_evidence)
     drop_recovery = source.index("former primary did not recover", drop_clear)
+    partial_apply = source.index("partial_loss_impairment.apply()", drop_recovery)
+    partial_outcomes = source.index("partial_loss_outcomes = observe_probe_outcomes(")
+    partial_traffic = source.index(
+        "partial_loss_impairment.verify_traffic_observed(", partial_outcomes
+    )
+    partial_evidence = source.index(
+        "partial_loss_evidence = verify_partial_loss_benchmark(", partial_traffic
+    )
+    partial_clear = source.index("partial_loss_impairment.clear()", partial_evidence)
+    partial_recovery = source.index(
+        "former primary did not recover after the partial-loss benchmark",
+        partial_clear,
+    )
     stale_fence = source.index("expected_state_sha256=former_state.state_sha256", heal)
     stale_callback = source.index("operation=stale_write", stale_fence)
     assert (
@@ -151,6 +167,12 @@ def test_drill_holds_external_epoch_fence_across_replay_admission() -> None:
         < drop_evidence
         < drop_clear
         < drop_recovery
+        < partial_apply
+        < partial_outcomes
+        < partial_traffic
+        < partial_evidence
+        < partial_clear
+        < partial_recovery
         < stale_fence
     )
     assert stale_fence < stale_callback
@@ -174,7 +196,10 @@ def test_drill_holds_external_epoch_fence_across_replay_admission() -> None:
     assert '"drop_probe_attempts": DROP_PROBE_ATTEMPTS' in source
     assert '"drop_probe_traffic_attempted_packets": (' in source
     assert '"drop_probe_traffic_drops": drop_probe_traffic.drops' in source
-    assert '"schema_version": 7' in source
+    assert '"seeded_partial_loss_benchmarked": True' in source
+    assert '"partial_loss_frequency_sanity_checked": True' in source
+    assert '"partial_loss_benchmark": partial_loss_evidence.as_dict()' in source
+    assert '"schema_version": 8' in source
     assert '"stale_authority_head_rejected_after_heal": True' in source
 
 

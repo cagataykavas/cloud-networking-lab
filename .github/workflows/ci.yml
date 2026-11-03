@@ -75,6 +75,9 @@ jobs:
           --reconnect-reorder-percent 25
           --reconnect-reorder-correlation-percent 50
           --loss-probe-percent 100
+          --partial-loss-percent 20
+          --partial-loss-seed 12648430
+          --partial-loss-attempts 128
           --receipt "${RUNNER_TEMP}/redis-sentinel-election-receipt.json"
           --timeout-seconds 30
       - name: Archive Sentinel election evidence

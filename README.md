@@ -65,8 +65,9 @@ This makes proxy retry/failover behavior visible. The Nginx config uses connecti
 | `tools/redis_sentinel_promotion.py` | fail-closed live Sentinel election adapter with multi-observer corroboration |
 | `tools/redis_failover_drill.py` | loopback-only stale-replica promotion fault injection with JSON evidence |
 | `tools/docker_egress_partition.py` | bounded iptables controller with verified rollback for one-way peer isolation |
-| `tools/docker_netem_impairment.py` | verified delay/reordering policy, traffic and queue-pressure counter proof, and cleanup for impaired reconnection |
+| `tools/docker_netem_impairment.py` | verified delay/reordering/loss policy, explicit PRNG seed, traffic counters, and cleanup |
 | `tools/network_latency_evidence.py` | bounded baseline/impairment/recovery RTT evidence with aggregate-only receipts |
+| `tools/network_loss_evidence.py` | bounded partial-loss probe outcomes and a 99% Wilson packet-frequency sanity check |
 | `tools/redis_sentinel_election_drill.py` | three-Sentinel partition, impaired healing and stale-head fence drill |
 | `docs/redis_replay_guard.md` | Redis Cluster slotting, same-connection `WAIT`, durability and failover boundaries |
 | `docker-compose.yml` | edge/private network segmentation and service discovery by DNS name |
@@ -97,6 +98,8 @@ curl -v http://localhost:8080/whoami
 
 ## Quality gates
 
-GitHub Actions runs Ruff, pytest, Docker Compose validation, a live three-Sentinel healing drill and a container build. The drill fails closed unless qdisc packet, byte, drop and overlimit counters are valid and monotonic, traffic crossed the active impairment, the configured delay is visible in aggregate round-trip latency, and latency returns to a bounded baseline band after cleanup. After healing, a separate 100% loss profile must block three bounded Redis probes, record at least three sent-plus-dropped packet attempts and a nonzero drop delta, then restore connectivity after verified qdisc cleanup. Receipts retain only bounded counter deltas and latency aggregates; raw probe timings, endpoints and payloads are not retained. The loss probe is deliberately deterministic and short; it proves drop observability, not application performance under partial loss. The project is intentionally small enough to reason about packet flow at a whiteboard but complete enough to reproduce the topology locally.
+GitHub Actions runs Ruff, pytest, Docker Compose validation, a live three-Sentinel healing drill and a container build. The drill fails closed unless qdisc packet, byte, drop and overlimit counters are valid and monotonic, traffic crossed the active impairment, the configured delay is visible in aggregate round-trip latency, and latency returns to a bounded baseline band after cleanup. After healing, a separate 100% loss profile must block three bounded Redis probes, record at least three sent-plus-dropped packet attempts and a nonzero drop delta, then restore connectivity after verified qdisc cleanup.
+
+The final benchmark applies independent 20% random loss with an explicit netem seed and a fixed 10 ms delay, runs 128 Redis probes under a 30-second budget, and requires both forwarded and dropped packet evidence. It also requires the configured rate to fall inside a two-sided 99% Wilson interval over qdisc packet attempts. The receipt retains only bounded probe outcome counts, duration, qdisc aggregates, the reviewed seed and interval; it does not retain endpoints, payloads, or individual timings. A seed makes netem's random sequence reproducible for an equivalent packet sequence, but TCP retransmission, scheduling and connection state can change the packet sequence, so this is a controlled regression benchmark rather than a production SLO or a claim that application failure rate should equal packet-loss rate. The project is intentionally small enough to reason about packet flow at a whiteboard but complete enough to reproduce the topology locally.
 
 

@@ -26,6 +26,10 @@ from tools.network_latency_evidence import (
     observe_round_trip_latency,
     verify_latency_shift,
 )
+from tools.network_loss_evidence import (
+    observe_probe_outcomes,
+    verify_partial_loss_benchmark,
+)
 from tools.redis_promotion_authority import (
     PromotionAuthorityConflict,
     SQLitePromotionAuthority,
@@ -78,6 +82,8 @@ def run_election_drill(
     partition: DockerEgressPartition,
     reconnect_impairment: DockerNetemImpairment,
     drop_probe_impairment: DockerNetemImpairment,
+    partial_loss_impairment: DockerNetemImpairment,
+    partial_loss_attempts: int = 128,
     timeout_seconds: float = 20.0,
 ) -> dict[str, Any]:
     """Partition one live primary, corroborate promotion, heal, and fence it."""
@@ -87,6 +93,23 @@ def run_election_drill(
         raise ValueError("timeout_seconds must be in [5, 60]")
     if drop_probe_impairment.loss_percent != 100:
         raise ValueError("drop probe requires a deterministic 100 percent loss policy")
+    if not 1 <= partial_loss_impairment.loss_percent <= 99:
+        raise ValueError("partial-loss benchmark requires a loss policy in [1, 99]")
+    if partial_loss_impairment.seed is None:
+        raise ValueError("partial-loss benchmark requires an explicit netem seed")
+    if (
+        partial_loss_impairment.delay_ms != 10
+        or partial_loss_impairment.jitter_ms != 0
+        or partial_loss_impairment.reorder_percent != 0
+        or partial_loss_impairment.reorder_correlation_percent != 0
+    ):
+        raise ValueError("partial-loss benchmark requires the reviewed seeded profile")
+    if (
+        isinstance(partial_loss_attempts, bool)
+        or not isinstance(partial_loss_attempts, int)
+        or not 32 <= partial_loss_attempts <= 512
+    ):
+        raise ValueError("partial_loss_attempts must be an integer in [32, 512]")
     policy = SentinelPromotionPolicy(
         master_name="replay-primary",
         candidate_host=candidate_advertised_host,
@@ -255,6 +278,32 @@ def run_election_drill(
                 timeout_seconds,
                 "former primary did not recover after the drop probe",
             )
+            partial_loss_impairment.apply()
+            partial_loss_outcomes = observe_probe_outcomes(
+                lambda: _can_ping(primary),
+                attempts=partial_loss_attempts,
+                max_duration_seconds=min(60, max(5, int(timeout_seconds))),
+            )
+            partial_loss_traffic = partial_loss_impairment.verify_traffic_observed(
+                require_drops=True,
+                minimum_packets=partial_loss_attempts,
+            )
+            partial_loss_evidence = verify_partial_loss_benchmark(
+                partial_loss_outcomes,
+                partial_loss_traffic,
+                configured_loss_percent=partial_loss_impairment.loss_percent,
+                seed=partial_loss_impairment.seed,
+            )
+            partial_loss_impairment.clear()
+            if partial_loss_impairment.active:
+                raise RuntimeError(
+                    "partial-loss benchmark impairment cleanup was not verified"
+                )
+            _wait_for(
+                lambda: _can_ping(primary),
+                timeout_seconds,
+                "former primary did not recover after the partial-loss benchmark",
+            )
 
             stale_callback_entered = False
 
@@ -295,6 +344,10 @@ def run_election_drill(
                 "reconnection_qdisc_pressure_counters_collected": True,
                 "reconnection_traffic_traversed_impairment": True,
                 "nonzero_drop_evidence_observed": True,
+                "partial_loss_connectivity_recovered": True,
+                "partial_loss_frequency_sanity_checked": True,
+                "partial_loss_impairment_removed": True,
+                "seeded_partial_loss_benchmarked": True,
                 "stale_authority_head_rejected_after_heal": True,
                 "three_sentinel_views_unanimous": True,
             },
@@ -318,6 +371,7 @@ def run_election_drill(
                 "drop_probe_traffic_packets": drop_probe_traffic.packets,
                 "minimum_replication_offset": offset_floor,
                 "observer_count": len(sentinels),
+                "partial_loss_benchmark": partial_loss_evidence.as_dict(),
                 "pre_failover_authority_head_sha256": former_state.state_sha256,
                 "promotion_proof_sha256": authorization.proof_sha256,
                 "reconnection_delay_ms": reconnect_impairment.delay_ms,
@@ -332,24 +386,27 @@ def run_election_drill(
                 "source_sha256": decision.source_sha256,
             },
             "run_id": run_id,
-            "scenario": "three-sentinel-election-impaired-heal-loss-probe",
-            "schema_version": 7,
+            "scenario": "three-sentinel-election-seeded-partial-loss",
+            "schema_version": 8,
             "status": "pass",
         }
     finally:
         try:
-            drop_probe_impairment.clear()
+            partial_loss_impairment.clear()
         finally:
             try:
-                reconnect_impairment.clear()
+                drop_probe_impairment.clear()
             finally:
                 try:
-                    partition.heal()
+                    reconnect_impairment.clear()
                 finally:
-                    primary.close()
-                    candidate.close()
-                    for sentinel in sentinels.values():
-                        sentinel.close()
+                    try:
+                        partition.heal()
+                    finally:
+                        primary.close()
+                        candidate.close()
+                        for sentinel in sentinels.values():
+                            sentinel.close()
 
 
 def write_receipt(receipt: dict[str, Any], output: Path) -> None:
@@ -526,6 +583,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--reconnect-reorder-percent", type=int, default=25)
     parser.add_argument("--reconnect-reorder-correlation-percent", type=int, default=50)
     parser.add_argument("--loss-probe-percent", type=int, default=100)
+    parser.add_argument("--partial-loss-percent", type=int, default=20)
+    parser.add_argument("--partial-loss-seed", type=int, default=12_648_430)
+    parser.add_argument("--partial-loss-attempts", type=int, default=128)
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=float, default=20.0)
     return parser
@@ -559,12 +619,22 @@ def main(argv: list[str] | None = None) -> int:
                 reorder_correlation_percent=0,
                 loss_percent=args.loss_probe_percent,
             ),
+            partial_loss_impairment=DockerNetemImpairment(
+                interface=args.reconnect_interface,
+                delay_ms=10,
+                jitter_ms=0,
+                reorder_percent=0,
+                reorder_correlation_percent=0,
+                loss_percent=args.partial_loss_percent,
+                seed=args.partial_loss_seed,
+            ),
+            partial_loss_attempts=args.partial_loss_attempts,
             timeout_seconds=args.timeout_seconds,
         )
     except (OSError, RedisError, RuntimeError, ValueError) as exc:
         receipt = {
             "error": str(exc),
-            "schema_version": 7,
+            "schema_version": 8,
             "started_at": started_at,
             "status": "error",
         }

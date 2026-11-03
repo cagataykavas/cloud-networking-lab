@@ -58,6 +58,7 @@ class DockerNetemImpairment:
     reorder_percent: int = 25
     reorder_correlation_percent: int = 50
     loss_percent: int = 0
+    seed: int | None = None
     timeout_seconds: float = 10.0
     runner: CommandRunner = field(default=run_command, repr=False)
     _active: bool = field(default=False, init=False, repr=False)
@@ -80,6 +81,17 @@ class DockerNetemImpairment:
             raise ValueError("reordering correlation requires packet reordering")
         if not 0 <= self.loss_percent <= 100:
             raise ValueError("packet loss must be in [0, 100] percent")
+        if self.seed is not None:
+            if (
+                isinstance(self.seed, bool)
+                or not isinstance(self.seed, int)
+                or not 1 <= self.seed <= MAX_COUNTER
+            ):
+                raise ValueError(
+                    "netem seed must be an unsigned nonzero 64-bit integer"
+                )
+            if self.loss_percent == 0:
+                raise ValueError("netem seed requires a packet-loss policy")
         if not 1.0 <= self.timeout_seconds <= 30.0:
             raise ValueError("network impairment timeout must be in [1, 30]")
 
@@ -207,6 +219,14 @@ class DockerNetemImpairment:
             )
         elif loss is not None:
             raise RuntimeError("live reconnection impairment does not match policy")
+        observed_seed = options.get("seed")
+        if self.seed is not None:
+            if (
+                isinstance(observed_seed, bool)
+                or not isinstance(observed_seed, int)
+                or observed_seed != self.seed
+            ):
+                raise RuntimeError("live reconnection impairment seed does not match")
         if (
             options.get("loss-state") is not None
             or options.get("loss-gemodel") is not None
@@ -274,6 +294,8 @@ class DockerNetemImpairment:
             )
         if self.loss_percent:
             policy += ("loss", "random", f"{self.loss_percent}%")
+        if self.seed is not None:
+            policy += ("seed", str(self.seed))
         return policy
 
     def _tc(self, action: str, *arguments: str) -> list[str]:
