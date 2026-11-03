@@ -97,6 +97,7 @@ def test_ci_runs_three_sentinel_election_and_archives_evidence() -> None:
     assert "--reconnect-jitter-ms 20" in workflow
     assert "--reconnect-reorder-percent 25" in workflow
     assert "--reconnect-reorder-correlation-percent 50" in workflow
+    assert "--loss-probe-percent 100" in workflow
     assert "steps.sentinel_election_drill.outcome == 'failure'" in workflow
     assert "logs --no-color --tail 200" in workflow
     assert "redis-sentinel-election down --volumes" in workflow
@@ -124,6 +125,13 @@ def test_drill_holds_external_epoch_fence_across_replay_admission() -> None:
     clear = source.index("reconnect_impairment.clear()", rejoined)
     recovery = source.index("recovery_latency = observe_round_trip_latency", clear)
     latency = source.index("latency_evidence = verify_latency_shift", recovery)
+    drop_apply = source.index("drop_probe_impairment.apply()", latency)
+    drop_attempts = source.index("range(DROP_PROBE_ATTEMPTS)", drop_apply)
+    drop_evidence = source.index(
+        "drop_probe_impairment.verify_traffic_observed(", drop_attempts
+    )
+    drop_clear = source.index("drop_probe_impairment.clear()", drop_evidence)
+    drop_recovery = source.index("former primary did not recover", drop_clear)
     stale_fence = source.index("expected_state_sha256=former_state.state_sha256", heal)
     stale_callback = source.index("operation=stale_write", stale_fence)
     assert (
@@ -138,6 +146,11 @@ def test_drill_holds_external_epoch_fence_across_replay_admission() -> None:
         < clear
         < recovery
         < latency
+        < drop_apply
+        < drop_attempts
+        < drop_evidence
+        < drop_clear
+        < drop_recovery
         < stale_fence
     )
     assert stale_fence < stale_callback
@@ -154,7 +167,14 @@ def test_drill_holds_external_epoch_fence_across_replay_admission() -> None:
         '"reconnection_traffic_overlimits": reconnection_traffic.overlimits' in source
     )
     assert '"reconnection_traffic_packets": reconnection_traffic.packets' in source
-    assert '"schema_version": 6' in source
+    assert '"deterministic_packet_loss_applied": True' in source
+    assert '"drop_probe_connectivity_recovered": True' in source
+    assert '"drop_probe_impairment_removed": True' in source
+    assert '"nonzero_drop_evidence_observed": True' in source
+    assert '"drop_probe_attempts": DROP_PROBE_ATTEMPTS' in source
+    assert '"drop_probe_traffic_attempted_packets": (' in source
+    assert '"drop_probe_traffic_drops": drop_probe_traffic.drops' in source
+    assert '"schema_version": 7' in source
     assert '"stale_authority_head_rejected_after_heal": True' in source
 
 

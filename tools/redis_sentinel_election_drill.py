@@ -43,6 +43,8 @@ from tools.redis_sentinel_promotion import (
     observe_sentinel_consensus,
 )
 
+DROP_PROBE_ATTEMPTS = 3
+
 
 def validate_election_endpoints(
     primary_url: str,
@@ -75,6 +77,7 @@ def run_election_drill(
     candidate_advertised_port: int,
     partition: DockerEgressPartition,
     reconnect_impairment: DockerNetemImpairment,
+    drop_probe_impairment: DockerNetemImpairment,
     timeout_seconds: float = 20.0,
 ) -> dict[str, Any]:
     """Partition one live primary, corroborate promotion, heal, and fence it."""
@@ -82,6 +85,8 @@ def run_election_drill(
     validate_election_endpoints(primary_url, candidate_url, sentinel_urls)
     if not 5.0 <= timeout_seconds <= 60.0:
         raise ValueError("timeout_seconds must be in [5, 60]")
+    if drop_probe_impairment.loss_percent != 100:
+        raise ValueError("drop probe requires a deterministic 100 percent loss policy")
     policy = SentinelPromotionPolicy(
         master_name="replay-primary",
         candidate_host=candidate_advertised_host,
@@ -233,6 +238,23 @@ def run_election_drill(
                 configured_delay_ms=reconnect_impairment.delay_ms,
                 configured_jitter_ms=reconnect_impairment.jitter_ms,
             )
+            drop_probe_impairment.apply()
+            if any(_can_ping(primary) for _ in range(DROP_PROBE_ATTEMPTS)):
+                raise RuntimeError(
+                    "100 percent loss policy did not block Redis replies"
+                )
+            drop_probe_traffic = drop_probe_impairment.verify_traffic_observed(
+                require_drops=True,
+                minimum_packets=DROP_PROBE_ATTEMPTS,
+            )
+            drop_probe_impairment.clear()
+            if drop_probe_impairment.active:
+                raise RuntimeError("drop probe impairment cleanup was not verified")
+            _wait_for(
+                lambda: _can_ping(primary),
+                timeout_seconds,
+                "former primary did not recover after the drop probe",
+            )
 
             stale_callback_entered = False
 
@@ -259,6 +281,9 @@ def run_election_drill(
             "boundary": {
                 "authority_advanced_before_admission": True,
                 "connectivity_restored_after_promotion": True,
+                "deterministic_packet_loss_applied": True,
+                "drop_probe_connectivity_recovered": True,
+                "drop_probe_impairment_removed": True,
                 "external_epoch_fence_held_during_admission": True,
                 "former_primary_alive_and_writable_during_partition": True,
                 "former_primary_rejoined_as_replica": True,
@@ -269,6 +294,7 @@ def run_election_drill(
                 "reconnection_latency_shift_observed": True,
                 "reconnection_qdisc_pressure_counters_collected": True,
                 "reconnection_traffic_traversed_impairment": True,
+                "nonzero_drop_evidence_observed": True,
                 "stale_authority_head_rejected_after_heal": True,
                 "three_sentinel_views_unanimous": True,
             },
@@ -281,6 +307,15 @@ def run_election_drill(
                 "former_primary_id_sha256": hashlib.sha256(
                     former_primary_id.encode("ascii")
                 ).hexdigest(),
+                "drop_probe_loss_percent": drop_probe_impairment.loss_percent,
+                "drop_probe_attempts": DROP_PROBE_ATTEMPTS,
+                "drop_probe_traffic_attempted_packets": (
+                    drop_probe_traffic.packets + drop_probe_traffic.drops
+                ),
+                "drop_probe_traffic_bytes": drop_probe_traffic.bytes,
+                "drop_probe_traffic_drops": drop_probe_traffic.drops,
+                "drop_probe_traffic_overlimits": drop_probe_traffic.overlimits,
+                "drop_probe_traffic_packets": drop_probe_traffic.packets,
                 "minimum_replication_offset": offset_floor,
                 "observer_count": len(sentinels),
                 "pre_failover_authority_head_sha256": former_state.state_sha256,
@@ -297,21 +332,24 @@ def run_election_drill(
                 "source_sha256": decision.source_sha256,
             },
             "run_id": run_id,
-            "scenario": "three-sentinel-election-impaired-partition-heal",
-            "schema_version": 6,
+            "scenario": "three-sentinel-election-impaired-heal-loss-probe",
+            "schema_version": 7,
             "status": "pass",
         }
     finally:
         try:
-            reconnect_impairment.clear()
+            drop_probe_impairment.clear()
         finally:
             try:
-                partition.heal()
+                reconnect_impairment.clear()
             finally:
-                primary.close()
-                candidate.close()
-                for sentinel in sentinels.values():
-                    sentinel.close()
+                try:
+                    partition.heal()
+                finally:
+                    primary.close()
+                    candidate.close()
+                    for sentinel in sentinels.values():
+                        sentinel.close()
 
 
 def write_receipt(receipt: dict[str, Any], output: Path) -> None:
@@ -487,6 +525,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--reconnect-jitter-ms", type=int, default=20)
     parser.add_argument("--reconnect-reorder-percent", type=int, default=25)
     parser.add_argument("--reconnect-reorder-correlation-percent", type=int, default=50)
+    parser.add_argument("--loss-probe-percent", type=int, default=100)
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=float, default=20.0)
     return parser
@@ -512,12 +551,20 @@ def main(argv: list[str] | None = None) -> int:
                     args.reconnect_reorder_correlation_percent
                 ),
             ),
+            drop_probe_impairment=DockerNetemImpairment(
+                interface=args.reconnect_interface,
+                delay_ms=10,
+                jitter_ms=0,
+                reorder_percent=0,
+                reorder_correlation_percent=0,
+                loss_percent=args.loss_probe_percent,
+            ),
             timeout_seconds=args.timeout_seconds,
         )
     except (OSError, RedisError, RuntimeError, ValueError) as exc:
         receipt = {
             "error": str(exc),
-            "schema_version": 5,
+            "schema_version": 7,
             "started_at": started_at,
             "status": "error",
         }

@@ -50,13 +50,14 @@ def run_command(command: list[str], timeout_seconds: float) -> str:
 
 @dataclass
 class DockerNetemImpairment:
-    """Delay and reorder former-primary egress while the topology heals."""
+    """Apply one bounded, verified netem policy to former-primary egress."""
 
     interface: str = "eth0"
     delay_ms: int = 200
     jitter_ms: int = 20
     reorder_percent: int = 25
     reorder_correlation_percent: int = 50
+    loss_percent: int = 0
     timeout_seconds: float = 10.0
     runner: CommandRunner = field(default=run_command, repr=False)
     _active: bool = field(default=False, init=False, repr=False)
@@ -71,10 +72,14 @@ class DockerNetemImpairment:
             raise ValueError("network delay must be in [10, 2000] milliseconds")
         if not 0 <= self.jitter_ms <= min(self.delay_ms, 1_000):
             raise ValueError("network jitter must be in [0, min(delay, 1000)]")
-        if not 1 <= self.reorder_percent <= 50:
-            raise ValueError("packet reordering must be in [1, 50] percent")
+        if not 0 <= self.reorder_percent <= 50:
+            raise ValueError("packet reordering must be in [0, 50] percent")
         if not 0 <= self.reorder_correlation_percent <= 100:
             raise ValueError("reordering correlation must be in [0, 100] percent")
+        if self.reorder_percent == 0 and self.reorder_correlation_percent != 0:
+            raise ValueError("reordering correlation requires packet reordering")
+        if not 0 <= self.loss_percent <= 100:
+            raise ValueError("packet loss must be in [0, 100] percent")
         if not 1.0 <= self.timeout_seconds <= 30.0:
             raise ValueError("network impairment timeout must be in [1, 30]")
 
@@ -94,10 +99,20 @@ class DockerNetemImpairment:
             self._clear(suppress_errors=True)
             raise
 
-    def verify_traffic_observed(self) -> QdiscTrafficDelta:
+    def verify_traffic_observed(
+        self, *, require_drops: bool = False, minimum_packets: int = 1
+    ) -> QdiscTrafficDelta:
         """Fail closed unless traffic counters advanced under the live policy."""
+        if (
+            isinstance(minimum_packets, bool)
+            or not isinstance(minimum_packets, int)
+            or not 1 <= minimum_packets <= 1_000
+        ):
+            raise ValueError("minimum_packets must be an integer in [1, 1000]")
         if not self.active or self._baseline_counters is None:
             raise RuntimeError("reconnection impairment is not active")
+        if require_drops and self.loss_percent == 0:
+            raise RuntimeError("drop evidence requires a configured loss policy")
         current = self._verify_live_policy()
         baseline = self._baseline_counters
         if any(
@@ -111,7 +126,14 @@ class DockerNetemImpairment:
             drops=current[2] - baseline[2],
             overlimits=current[3] - baseline[3],
         )
-        if delta.packets < 1 or delta.bytes < 1:
+        if require_drops:
+            if delta.drops < 1:
+                raise RuntimeError(
+                    "no packet drops were recorded under the loss policy"
+                )
+            if delta.packets + delta.drops < minimum_packets:
+                raise RuntimeError("insufficient traffic traversed the loss policy")
+        elif delta.packets < minimum_packets or delta.bytes < 1:
             raise RuntimeError("no reconnection traffic traversed the impairment")
         return delta
 
@@ -149,17 +171,47 @@ class DockerNetemImpairment:
             raise RuntimeError("live reconnection impairment options are unavailable")
         delay = options.get("delay")
         reorder = options.get("reorder")
-        if not isinstance(delay, dict) or not isinstance(reorder, dict):
+        if not isinstance(delay, dict):
             raise RuntimeError("live reconnection impairment options are incomplete")
-        expected = (
+        expected: list[tuple[object, float]] = [
             (delay.get("delay"), self.delay_ms / 1_000),
             (delay.get("jitter"), self.jitter_ms / 1_000),
-            (reorder.get("reorder"), self.reorder_percent / 100),
-            (
-                reorder.get("correlation"),
-                self.reorder_correlation_percent / 100,
-            ),
-        )
+        ]
+        if self.reorder_percent:
+            if not isinstance(reorder, dict):
+                raise RuntimeError(
+                    "live reconnection impairment options are incomplete"
+                )
+            expected.extend(
+                (
+                    (reorder.get("reorder"), self.reorder_percent / 100),
+                    (
+                        reorder.get("correlation"),
+                        self.reorder_correlation_percent / 100,
+                    ),
+                )
+            )
+        elif reorder is not None:
+            raise RuntimeError("live reconnection impairment does not match policy")
+        loss = options.get("loss-random")
+        if self.loss_percent:
+            if not isinstance(loss, dict):
+                raise RuntimeError(
+                    "live reconnection impairment options are incomplete"
+                )
+            expected.extend(
+                (
+                    (loss.get("loss"), self.loss_percent / 100),
+                    (loss.get("correlation"), 0.0),
+                )
+            )
+        elif loss is not None:
+            raise RuntimeError("live reconnection impairment does not match policy")
+        if (
+            options.get("loss-state") is not None
+            or options.get("loss-gemodel") is not None
+        ):
+            raise RuntimeError("live reconnection impairment does not match policy")
         if any(
             not isinstance(observed, (int, float))
             or abs(observed - required) > 0.000001
@@ -205,7 +257,7 @@ class DockerNetemImpairment:
         return document
 
     def _policy_arguments(self) -> tuple[str, ...]:
-        return (
+        policy = (
             "root",
             "handle",
             HANDLE,
@@ -213,10 +265,16 @@ class DockerNetemImpairment:
             "delay",
             f"{self.delay_ms}ms",
             f"{self.jitter_ms}ms",
-            "reorder",
-            f"{self.reorder_percent}%",
-            f"{self.reorder_correlation_percent}%",
         )
+        if self.reorder_percent:
+            policy += (
+                "reorder",
+                f"{self.reorder_percent}%",
+                f"{self.reorder_correlation_percent}%",
+            )
+        if self.loss_percent:
+            policy += ("loss", "random", f"{self.loss_percent}%")
+        return policy
 
     def _tc(self, action: str, *arguments: str) -> list[str]:
         return [
