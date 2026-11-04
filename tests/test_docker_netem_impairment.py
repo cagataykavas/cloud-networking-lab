@@ -23,13 +23,14 @@ def qdisc_document(
     correlation: float = 0.5,
     loss: float | None = None,
     seed: int | None = None,
+    limit: object = 1_000,
     packets: int = 0,
     bytes_: int = 0,
     drops: int = 0,
     overlimits: int = 0,
 ) -> str:
     options: dict[str, object] = {
-        "limit": 1_000,
+        "limit": limit,
         "delay": {"delay": delay, "jitter": jitter, "correlation": 0},
         "gap": 1,
     }
@@ -108,6 +109,8 @@ def test_applies_verifies_and_removes_exact_netem_policy() -> None:
         "handle",
         "1:",
         "netem",
+        "limit",
+        "1000",
         "delay",
         "200ms",
         "20ms",
@@ -239,6 +242,22 @@ def test_accepts_kernel_generated_seed_when_policy_does_not_pin_one() -> None:
 
     impairment.apply()
     impairment.clear()
+
+
+@pytest.mark.parametrize("observed_limit", [None, 999, True])
+def test_rejects_missing_or_mismatched_live_queue_limit(
+    observed_limit: object,
+) -> None:
+    impairment = DockerNetemImpairment(
+        runner=RecordingRunner(
+            live_document=qdisc_document(limit=observed_limit)
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="queue limit does not match"):
+        impairment.apply()
+
+    assert not impairment.active
 
 
 @pytest.mark.parametrize("observed_seed", [None, 12_648_431, True])
@@ -468,6 +487,9 @@ def test_failed_cleanup_remains_active_for_retry() -> None:
         {"loss_percent": 20, "seed": True},
         {"loss_percent": 20, "seed": 0},
         {"loss_percent": 20, "seed": MAX_COUNTER + 1},
+        {"queue_limit_packets": True},
+        {"queue_limit_packets": 0},
+        {"queue_limit_packets": 100_001},
         {"timeout_seconds": 31},
     ],
 )
