@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
@@ -14,6 +15,58 @@ SERVICE = "redis_election_primary"
 HANDLE = "1:"
 CommandRunner = Callable[[list[str], float], str]
 MAX_COUNTER = (1 << 64) - 1
+RUNTIME_FINGERPRINT_SCHEMA = "netem-runtime-fingerprint/v1"
+_DIGEST = re.compile(r"[0-9a-f]{64}")
+
+
+def _canonical(value: object) -> bytes:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+
+
+@dataclass(frozen=True, slots=True)
+class NetemRuntimeFingerprint:
+    """Privacy-reduced kernel and traffic-control toolchain identity."""
+
+    kernel_release_sha256: str
+    tc_version_sha256: str
+    environment_sha256: str
+    schema_version: str = RUNTIME_FINGERPRINT_SCHEMA
+
+    def __post_init__(self) -> None:
+        if self.schema_version != RUNTIME_FINGERPRINT_SCHEMA or any(
+            not isinstance(value, str) or _DIGEST.fullmatch(value) is None
+            for value in (
+                self.kernel_release_sha256,
+                self.tc_version_sha256,
+                self.environment_sha256,
+            )
+        ):
+            raise ValueError("netem runtime fingerprint is invalid")
+        expected = hashlib.sha256(
+            _canonical(
+                {
+                    "kernel_release_sha256": self.kernel_release_sha256,
+                    "schema_version": self.schema_version,
+                    "tc_version_sha256": self.tc_version_sha256,
+                }
+            )
+        ).hexdigest()
+        if self.environment_sha256 != expected:
+            raise ValueError("netem runtime fingerprint commitment is invalid")
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "environment_sha256": self.environment_sha256,
+            "kernel_release_sha256": self.kernel_release_sha256,
+            "schema_version": self.schema_version,
+            "tc_version_sha256": self.tc_version_sha256,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +171,43 @@ class DockerNetemImpairment:
             self._clear(suppress_errors=True)
             raise
 
+    def runtime_fingerprint(self) -> NetemRuntimeFingerprint:
+        """Hash the bounded kernel and iproute2 versions used by this controller."""
+        kernel_release = self._runtime_value(
+            self.runner(
+                self._exec_command("uname", "-r"),
+                self.timeout_seconds,
+            ),
+            label="kernel release",
+            maximum_bytes=128,
+            pattern=r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}",
+        )
+        tc_version = self._runtime_value(
+            self.runner(
+                self._exec_command("tc", "-Version"),
+                self.timeout_seconds,
+            ),
+            label="tc version",
+            maximum_bytes=256,
+            pattern=r"tc utility, iproute2-[ -~]{1,230}",
+        )
+        kernel_digest = hashlib.sha256(kernel_release.encode("ascii")).hexdigest()
+        tc_digest = hashlib.sha256(tc_version.encode("ascii")).hexdigest()
+        environment_digest = hashlib.sha256(
+            _canonical(
+                {
+                    "kernel_release_sha256": kernel_digest,
+                    "schema_version": RUNTIME_FINGERPRINT_SCHEMA,
+                    "tc_version_sha256": tc_digest,
+                }
+            )
+        ).hexdigest()
+        return NetemRuntimeFingerprint(
+            kernel_release_sha256=kernel_digest,
+            tc_version_sha256=tc_digest,
+            environment_sha256=environment_digest,
+        )
+
     def verify_traffic_observed(
         self, *, require_drops: bool = False, minimum_packets: int = 1
     ) -> QdiscTrafficDelta:
@@ -194,7 +284,9 @@ class DockerNetemImpairment:
             or not isinstance(observed_limit, int)
             or observed_limit != self.queue_limit_packets
         ):
-            raise RuntimeError("live reconnection impairment queue limit does not match")
+            raise RuntimeError(
+                "live reconnection impairment queue limit does not match"
+            )
         delay = options.get("delay")
         reorder = options.get("reorder")
         if not isinstance(delay, dict):
@@ -347,4 +439,39 @@ class DockerNetemImpairment:
             "show",
             "dev",
             self.interface,
+        ]
+
+    @staticmethod
+    def _runtime_value(
+        raw: str,
+        *,
+        label: str,
+        maximum_bytes: int,
+        pattern: str,
+    ) -> str:
+        try:
+            encoded = raw.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise RuntimeError(f"{label} is not canonical ASCII") from exc
+        value = raw.strip()
+        if (
+            not 1 <= len(encoded) <= maximum_bytes
+            or "\n" in value
+            or "\r" in value
+            or re.fullmatch(pattern, value) is None
+        ):
+            raise RuntimeError(f"{label} is malformed or outside the byte limit")
+        return value
+
+    @staticmethod
+    def _exec_command(*arguments: str) -> list[str]:
+        return [
+            "docker",
+            "compose",
+            "exec",
+            "-T",
+            "--user",
+            "0",
+            SERVICE,
+            *arguments,
         ]

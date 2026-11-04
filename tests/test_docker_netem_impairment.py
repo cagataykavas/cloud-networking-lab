@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 
@@ -8,8 +9,10 @@ import pytest
 from tools.docker_netem_impairment import (
     HANDLE,
     MAX_COUNTER,
+    RUNTIME_FINGERPRINT_SCHEMA,
     SERVICE,
     DockerNetemImpairment,
+    NetemRuntimeFingerprint,
     QdiscTrafficDelta,
     run_command,
 )
@@ -141,6 +144,67 @@ def test_applies_verifies_and_removes_exact_netem_policy() -> None:
     assert all(timeout == 7 for _, timeout in runner.commands)
 
 
+def test_fingerprints_bounded_kernel_and_iproute2_versions_privately() -> None:
+    commands: list[list[str]] = []
+
+    def runner(command: list[str], _timeout: float) -> str:
+        commands.append(command)
+        if command[-2:] == ["uname", "-r"]:
+            return "6.11.0-1018-azure\n"
+        if command[-2:] == ["tc", "-Version"]:
+            return "tc utility, iproute2-6.11.0, libbpf 1.4.7\n"
+        raise AssertionError(command)
+
+    fingerprint = DockerNetemImpairment(runner=runner).runtime_fingerprint()
+
+    assert fingerprint.schema_version == RUNTIME_FINGERPRINT_SCHEMA
+    assert (
+        fingerprint.kernel_release_sha256
+        == hashlib.sha256(b"6.11.0-1018-azure").hexdigest()
+    )
+    assert (
+        fingerprint.tc_version_sha256
+        == hashlib.sha256(b"tc utility, iproute2-6.11.0, libbpf 1.4.7").hexdigest()
+    )
+    assert len(fingerprint.environment_sha256) == 64
+    serialized = json.dumps(fingerprint.as_dict(), sort_keys=True)
+    assert "6.11.0" not in serialized
+    assert all(
+        command[:7] == ["docker", "compose", "exec", "-T", "--user", "0", SERVICE]
+        for command in commands
+    )
+
+
+@pytest.mark.parametrize(
+    ("kernel_release", "tc_version"),
+    [
+        ("", "tc utility, iproute2-6.11.0"),
+        ("6.11.0\nsecond-line", "tc utility, iproute2-6.11.0"),
+        ("6.11.0", "iproute2-6.11.0"),
+        ("6.11.0", "tc utility, iproute2-6.11.0\nforged"),
+        ("6.11.0-λ", "tc utility, iproute2-6.11.0"),
+    ],
+)
+def test_rejects_malformed_runtime_provenance(
+    kernel_release: str,
+    tc_version: str,
+) -> None:
+    def runner(command: list[str], _timeout: float) -> str:
+        return kernel_release if command[-2:] == ["uname", "-r"] else tc_version
+
+    with pytest.raises(RuntimeError, match="malformed|canonical ASCII"):
+        DockerNetemImpairment(runner=runner).runtime_fingerprint()
+
+
+def test_rejects_tampered_runtime_fingerprint_commitment() -> None:
+    with pytest.raises(ValueError, match="commitment"):
+        NetemRuntimeFingerprint(
+            kernel_release_sha256="a" * 64,
+            tc_version_sha256="b" * 64,
+            environment_sha256="c" * 64,
+        )
+
+
 def test_proves_traffic_crossed_the_verified_impairment() -> None:
     runner = RecordingRunner(
         show_documents=[
@@ -249,9 +313,7 @@ def test_rejects_missing_or_mismatched_live_queue_limit(
     observed_limit: object,
 ) -> None:
     impairment = DockerNetemImpairment(
-        runner=RecordingRunner(
-            live_document=qdisc_document(limit=observed_limit)
-        )
+        runner=RecordingRunner(live_document=qdisc_document(limit=observed_limit))
     )
 
     with pytest.raises(RuntimeError, match="queue limit does not match"):
