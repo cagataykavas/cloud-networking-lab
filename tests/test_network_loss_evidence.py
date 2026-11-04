@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import pytest
 
-from tools.docker_netem_impairment import QdiscTrafficDelta
+from tools.docker_netem_impairment import NetemRuntimeFingerprint, QdiscTrafficDelta
 from tools.network_loss_evidence import (
     ProbeOutcomeSummary,
     observe_probe_outcomes,
     verify_partial_loss_benchmark,
+)
+
+
+RUNTIME_FINGERPRINT = NetemRuntimeFingerprint(
+    kernel_release_sha256="a" * 64,
+    tc_version_sha256="b" * 64,
+    environment_sha256="e0916a8d67df9cb2e4bbbd4e5c1366b2aad82c7130182775b334ca6f4005c69f",
 )
 
 
@@ -44,12 +51,15 @@ def test_verifies_seeded_partial_loss_with_a_99_percent_interval() -> None:
         ),
         configured_loss_percent=20,
         seed=12_648_430,
+        runtime_fingerprint=RUNTIME_FINGERPRINT,
     )
 
     assert evidence.observed_drop_basis_points == 2_000
     assert evidence.drop_interval_min_basis_points < 2_000
     assert evidence.drop_interval_max_basis_points > 2_000
     assert evidence.qdisc_attempted_packets == 1_000
+    assert evidence.runtime_fingerprint == RUNTIME_FINGERPRINT
+    assert evidence.as_dict()["runtime_fingerprint"] == RUNTIME_FINGERPRINT.as_dict()
     assert evidence.as_dict()["probe_outcomes"] == {
         "attempts": 128,
         "successes": 124,
@@ -94,6 +104,7 @@ def test_rejects_incomplete_or_implausible_partial_loss_evidence(
             traffic,
             configured_loss_percent=20,
             seed=12_648_430,
+            runtime_fingerprint=RUNTIME_FINGERPRINT,
         )
 
 
@@ -132,4 +143,16 @@ def test_rejects_invalid_partial_loss_policy(
             QdiscTrafficDelta(80, 1_000, 20, 0),
             configured_loss_percent=loss_percent,  # type: ignore[arg-type]
             seed=seed,  # type: ignore[arg-type]
+            runtime_fingerprint=RUNTIME_FINGERPRINT,
+        )
+
+
+def test_rejects_unvalidated_runtime_fingerprint() -> None:
+    with pytest.raises(ValueError, match="runtime_fingerprint"):
+        verify_partial_loss_benchmark(
+            ProbeOutcomeSummary(32, 30, 2, 10),
+            QdiscTrafficDelta(80, 1_000, 20, 0),
+            configured_loss_percent=20,
+            seed=12_648_430,
+            runtime_fingerprint="untrusted",  # type: ignore[arg-type]
         )

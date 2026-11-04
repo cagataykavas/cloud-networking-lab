@@ -278,6 +278,7 @@ def run_election_drill(
                 timeout_seconds,
                 "former primary did not recover after the drop probe",
             )
+            partial_loss_runtime = partial_loss_impairment.runtime_fingerprint()
             partial_loss_impairment.apply()
             partial_loss_outcomes = observe_probe_outcomes(
                 lambda: _can_ping(primary),
@@ -293,6 +294,7 @@ def run_election_drill(
                 partial_loss_traffic,
                 configured_loss_percent=partial_loss_impairment.loss_percent,
                 seed=partial_loss_impairment.seed,
+                runtime_fingerprint=partial_loss_runtime,
             )
             partial_loss_impairment.clear()
             if partial_loss_impairment.active:
@@ -347,6 +349,7 @@ def run_election_drill(
                 "partial_loss_connectivity_recovered": True,
                 "partial_loss_frequency_sanity_checked": True,
                 "partial_loss_impairment_removed": True,
+                "partial_loss_runtime_fingerprinted": True,
                 "seeded_partial_loss_benchmarked": True,
                 "stale_authority_head_rejected_after_heal": True,
                 "three_sentinel_views_unanimous": True,
@@ -387,7 +390,7 @@ def run_election_drill(
             },
             "run_id": run_id,
             "scenario": "three-sentinel-election-seeded-partial-loss",
-            "schema_version": 8,
+            "schema_version": 9,
             "status": "pass",
         }
     finally:
@@ -634,7 +637,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, RedisError, RuntimeError, ValueError) as exc:
         receipt = {
             "error": str(exc),
-            "schema_version": 8,
+            "schema_version": 9,
             "started_at": started_at,
             "status": "error",
         }

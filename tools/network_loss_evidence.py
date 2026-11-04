@@ -8,7 +8,11 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from tools.docker_netem_impairment import MAX_COUNTER, QdiscTrafficDelta
+from tools.docker_netem_impairment import (
+    MAX_COUNTER,
+    NetemRuntimeFingerprint,
+    QdiscTrafficDelta,
+)
 
 
 Probe = Callable[[], bool]
@@ -53,6 +57,7 @@ class PartialLossBenchmarkEvidence:
 
     configured_loss_percent: int
     seed: int
+    runtime_fingerprint: NetemRuntimeFingerprint
     probe_outcomes: ProbeOutcomeSummary
     qdisc_attempted_packets: int
     qdisc_forwarded_packets: int
@@ -77,6 +82,8 @@ class PartialLossBenchmarkEvidence:
             or not 1 <= self.seed <= MAX_COUNTER
         ):
             raise ValueError("seed must be an unsigned nonzero 64-bit integer")
+        if not isinstance(self.runtime_fingerprint, NetemRuntimeFingerprint):
+            raise ValueError("runtime_fingerprint must be validated netem provenance")
         if not isinstance(self.probe_outcomes, ProbeOutcomeSummary):
             raise ValueError("probe_outcomes must be a validated summary")
         if any(
@@ -166,6 +173,7 @@ def verify_partial_loss_benchmark(
     *,
     configured_loss_percent: int,
     seed: int,
+    runtime_fingerprint: NetemRuntimeFingerprint,
 ) -> PartialLossBenchmarkEvidence:
     """Fail closed on missing pass/drop evidence or an implausible loss frequency."""
     if (
@@ -176,6 +184,8 @@ def verify_partial_loss_benchmark(
         raise ValueError("configured_loss_percent must be an integer in [1, 99]")
     if isinstance(seed, bool) or not isinstance(seed, int) or not 1 <= seed < 1 << 64:
         raise ValueError("seed must be an unsigned nonzero 64-bit integer")
+    if not isinstance(runtime_fingerprint, NetemRuntimeFingerprint):
+        raise ValueError("runtime_fingerprint must be validated netem provenance")
     if outcomes.successes < 1:
         raise RuntimeError("partial-loss benchmark observed no successful probes")
     if traffic.packets < 1 or traffic.drops < 1:
@@ -207,6 +217,7 @@ def verify_partial_loss_benchmark(
     return PartialLossBenchmarkEvidence(
         configured_loss_percent=configured_loss_percent,
         seed=seed,
+        runtime_fingerprint=runtime_fingerprint,
         probe_outcomes=outcomes,
         qdisc_attempted_packets=attempted_packets,
         qdisc_forwarded_packets=traffic.packets,

@@ -135,7 +135,11 @@ def test_drill_holds_external_epoch_fence_across_replay_admission() -> None:
     )
     drop_clear = source.index("drop_probe_impairment.clear()", drop_evidence)
     drop_recovery = source.index("former primary did not recover", drop_clear)
-    partial_apply = source.index("partial_loss_impairment.apply()", drop_recovery)
+    partial_runtime = source.index(
+        "partial_loss_runtime = partial_loss_impairment.runtime_fingerprint()",
+        drop_recovery,
+    )
+    partial_apply = source.index("partial_loss_impairment.apply()", partial_runtime)
     partial_outcomes = source.index("partial_loss_outcomes = observe_probe_outcomes(")
     partial_traffic = source.index(
         "partial_loss_impairment.verify_traffic_observed(", partial_outcomes
@@ -167,6 +171,7 @@ def test_drill_holds_external_epoch_fence_across_replay_admission() -> None:
         < drop_evidence
         < drop_clear
         < drop_recovery
+        < partial_runtime
         < partial_apply
         < partial_outcomes
         < partial_traffic
@@ -197,9 +202,10 @@ def test_drill_holds_external_epoch_fence_across_replay_admission() -> None:
     assert '"drop_probe_traffic_attempted_packets": (' in source
     assert '"drop_probe_traffic_drops": drop_probe_traffic.drops' in source
     assert '"seeded_partial_loss_benchmarked": True' in source
+    assert '"partial_loss_runtime_fingerprinted": True' in source
     assert '"partial_loss_frequency_sanity_checked": True' in source
     assert '"partial_loss_benchmark": partial_loss_evidence.as_dict()' in source
-    assert '"schema_version": 8' in source
+    assert '"schema_version": 9' in source
     assert '"stale_authority_head_rejected_after_heal": True' in source
 
 
