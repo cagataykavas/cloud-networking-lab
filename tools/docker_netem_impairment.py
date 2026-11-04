@@ -59,6 +59,7 @@ class DockerNetemImpairment:
     reorder_correlation_percent: int = 50
     loss_percent: int = 0
     seed: int | None = None
+    queue_limit_packets: int = 1_000
     timeout_seconds: float = 10.0
     runner: CommandRunner = field(default=run_command, repr=False)
     _active: bool = field(default=False, init=False, repr=False)
@@ -92,6 +93,12 @@ class DockerNetemImpairment:
                 )
             if self.loss_percent == 0:
                 raise ValueError("netem seed requires a packet-loss policy")
+        if (
+            isinstance(self.queue_limit_packets, bool)
+            or not isinstance(self.queue_limit_packets, int)
+            or not 1 <= self.queue_limit_packets <= 100_000
+        ):
+            raise ValueError("netem queue limit must be in [1, 100000] packets")
         if not 1.0 <= self.timeout_seconds <= 30.0:
             raise ValueError("network impairment timeout must be in [1, 30]")
 
@@ -181,6 +188,13 @@ class DockerNetemImpairment:
         options = matches[0].get("options")
         if not isinstance(options, dict):
             raise RuntimeError("live reconnection impairment options are unavailable")
+        observed_limit = options.get("limit")
+        if (
+            isinstance(observed_limit, bool)
+            or not isinstance(observed_limit, int)
+            or observed_limit != self.queue_limit_packets
+        ):
+            raise RuntimeError("live reconnection impairment queue limit does not match")
         delay = options.get("delay")
         reorder = options.get("reorder")
         if not isinstance(delay, dict):
@@ -282,6 +296,8 @@ class DockerNetemImpairment:
             "handle",
             HANDLE,
             "netem",
+            "limit",
+            str(self.queue_limit_packets),
             "delay",
             f"{self.delay_ms}ms",
             f"{self.jitter_ms}ms",
