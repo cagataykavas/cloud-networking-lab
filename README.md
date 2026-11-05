@@ -68,6 +68,7 @@ This makes proxy retry/failover behavior visible. The Nginx config uses connecti
 | `tools/docker_netem_impairment.py` | verified delay/reordering/loss policy, pinned queue limit and PRNG seed, runtime provenance, traffic counters, and cleanup |
 | `tools/network_latency_evidence.py` | bounded baseline/impairment/recovery RTT evidence with aggregate-only receipts |
 | `tools/network_loss_evidence.py` | bounded partial-loss probe outcomes and a 99% Wilson packet-frequency sanity check |
+| `tools/compare_network_loss_evidence.py` | runtime-compatible retained benchmark regression gate with privacy-reduced evidence |
 | `tools/redis_sentinel_election_drill.py` | three-Sentinel partition, impaired healing and stale-head fence drill |
 | `docs/redis_replay_guard.md` | Redis Cluster slotting, same-connection `WAIT`, durability and failover boundaries |
 | `docker-compose.yml` | edge/private network segmentation and service discovery by DNS name |
@@ -103,5 +104,32 @@ GitHub Actions runs Ruff, pytest, Docker Compose validation, a live three-Sentin
 The final benchmark applies independent 20% random loss with an explicit netem seed and a fixed 10 ms delay, runs 128 Redis probes under a 30-second budget, and requires both forwarded and dropped packet evidence. It also requires the configured rate to fall inside a two-sided 99% Wilson interval over qdisc packet attempts. Immediately before installing the policy, the controller records bounded canonical kernel-release and `tc`/iproute2 version strings, hashes each value, and commits both hashes into a schema-v1 runtime fingerprint. Schema-v9 drill evidence embeds only those digests alongside bounded probe outcome counts, duration, qdisc aggregates, the reviewed seed and interval; it does not retain host versions, endpoints, payloads, or individual timings.
 
 The runtime fingerprint makes cross-run environment drift visible; it does not prove that two kernels implement netem identically or that the packet sequence is equivalent. A seed makes netem's random sequence reproducible only for a compatible implementation and equivalent packet sequence. TCP retransmission, scheduling and connection state can still change that sequence, so this is a controlled regression benchmark rather than a production SLO or a claim that application failure rate should equal packet-loss rate. The project is intentionally small enough to reason about packet flow at a whiteboard but complete enough to reproduce the topology locally.
+
+Extract two retained `partial_loss_benchmark` objects and compare them only after their exact
+runtime fingerprints and experiment policies match:
+
+```bash
+jq '.partial_loss_benchmark' baseline-drill.json > baseline-benchmark.json
+jq '.partial_loss_benchmark' candidate-drill.json > candidate-benchmark.json
+
+python -m tools.compare_network_loss_evidence \
+  baseline-benchmark.json candidate-benchmark.json \
+  --max-failure-rate-increase-basis-points 250 \
+  --max-elapsed-increase-basis-points 2000 \
+  --output benchmark-comparison.json
+```
+
+The loader rejects final-path symlinks, duplicate JSON keys, unknown fields, malformed runtime
+commitments, and self-consistent-looking statistical substitutions by recomputing the observed
+drop rate and 99% Wilson interval. Comparison then requires the same kernel/toolchain fingerprint,
+configured loss, seed, probe count, and confidence level. Exit code `0` admits the candidate, `3`
+records a valid but over-budget regression, and `2` rejects incomparable or malformed evidence.
+The private comparison receipt contains source and policy commitments plus bounded deltas, not raw
+runtime versions, endpoints, payloads, or individual timings.
+
+Matching digests establish input compatibility, not semantic equivalence between kernels or
+identical packet sequences. The default budgets allow a 2.5 percentage-point failure-rate increase
+and a 20% elapsed-time increase; deployments should review and pin budgets appropriate to their
+test stability before treating the result as a release gate.
 
 
