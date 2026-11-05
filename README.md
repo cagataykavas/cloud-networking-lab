@@ -69,6 +69,7 @@ This makes proxy retry/failover behavior visible. The Nginx config uses connecti
 | `tools/network_latency_evidence.py` | bounded baseline/impairment/recovery RTT evidence with aggregate-only receipts |
 | `tools/network_loss_evidence.py` | bounded partial-loss probe outcomes and a 99% Wilson packet-frequency sanity check |
 | `tools/compare_network_loss_evidence.py` | runtime-compatible retained benchmark regression gate with privacy-reduced evidence |
+| `tools/authorize_network_loss_baseline.py` | Ed25519-reviewed baseline selection and protected-workflow comparison gate |
 | `tools/redis_sentinel_election_drill.py` | three-Sentinel partition, impaired healing and stale-head fence drill |
 | `docs/redis_replay_guard.md` | Redis Cluster slotting, same-connection `WAIT`, durability and failover boundaries |
 | `docker-compose.yml` | edge/private network segmentation and service discovery by DNS name |
@@ -131,5 +132,37 @@ Matching digests establish input compatibility, not semantic equivalence between
 identical packet sequences. The default budgets allow a 2.5 percentage-point failure-rate increase
 and a 20% elapsed-time increase; deployments should review and pin budgets appropriate to their
 test stability before treating the result as a release gate.
+
+For a protected release workflow, require a reviewer-selected baseline instead of invoking the
+diagnostic comparator directly. A protected signer calls `create_baseline_authorization` with the
+validated baseline, reviewed budgets, repository ID, exact workflow commit, bounded validity
+window, Ed25519 public key and signing callback. The returned canonical envelope contains the
+baseline, runtime and experiment-policy commitments; it never contains the private key.
+
+```bash
+python -m tools.authorize_network_loss_baseline \
+  baseline-authorization.json baseline-benchmark.json candidate-benchmark.json \
+  --selector-key-id netem-baseline-review-2026-11 \
+  --selector-public-key-sha256 "$NETEM_BASELINE_SELECTOR_PUBLIC_KEY_SHA256" \
+  --repository-id 1330973695 \
+  --workflow-sha "$GITHUB_SHA" \
+  --max-failure-rate-increase-basis-points 250 \
+  --max-elapsed-increase-basis-points 2000 \
+  --output authorized-benchmark-comparison.json
+```
+
+The gate pins the Ed25519 public key out of band, verifies the signature before trusting signed
+claims, enforces a maximum 24-hour authorization lifetime, and requires an exact match for the
+baseline digest, runtime fingerprint, experiment policy, budgets, repository and workflow commit.
+Only then does it run the existing compatibility and regression checks. Exit code `0` admits the
+candidate, `3` retains an authenticated over-budget result, and `2` rejects untrusted, stale,
+malformed or mismatched inputs. The private receipt retains commitments and bounded deltas, not the
+repository ID, workflow commit, signature, raw public key, runtime versions or probe samples.
+
+This is a release authorization boundary, not key custody, authenticated time, reviewer quorum or
+artifact transparency. The protected workflow must control the selector key and public-key pin,
+supply a trustworthy verification time, and retain the signed authorization and resulting receipt
+in independently controlled immutable storage. Key revocation and threshold review remain future
+hardening steps.
 
 
