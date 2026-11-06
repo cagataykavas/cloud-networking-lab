@@ -71,6 +71,7 @@ This makes proxy retry/failover behavior visible. The Nginx config uses connecti
 | `tools/compare_network_loss_evidence.py` | runtime-compatible retained benchmark regression gate with privacy-reduced evidence |
 | `tools/authorize_network_loss_baseline.py` | Ed25519-reviewed baseline selection and protected-workflow comparison gate |
 | `tools/network_loss_selector_key_status.py` | independently signed selector-key freshness and revocation status |
+| `tools/network_loss_release_epoch.py` | authenticated release time bound to one exact netem gate |
 | `tools/redis_sentinel_election_drill.py` | three-Sentinel partition, impaired healing and stale-head fence drill |
 | `docs/redis_replay_guard.md` | Redis Cluster slotting, same-connection `WAIT`, durability and failover boundaries |
 | `docker-compose.yml` | edge/private network segmentation and service discovery by DNS name |
@@ -146,14 +147,22 @@ Ed25519 signing callback. The authority key must be cryptographically distinct f
 key. Store the resulting status envelope beside the baseline authorization; pin both public-key
 digests and both key IDs outside the artifacts.
 
+After the candidate artifact is final, a third, independent release authority calls
+`create_release_epoch` with the canonical authorization and status digests, exact baseline and
+candidate digests, repository ID, workflow commit and asserted UTC release time. Its Ed25519 key and
+key ID must be distinct from both selector roles and pinned outside the statement. This turns time
+into an authenticated, input-bound release decision instead of a caller-selected CLI value.
+
 ```bash
 python -m tools.authorize_network_loss_baseline \
-  baseline-authorization.json selector-key-status.json \
+  baseline-authorization.json selector-key-status.json release-epoch.json \
   baseline-benchmark.json candidate-benchmark.json \
   --selector-key-id netem-baseline-review-2026-11 \
   --selector-public-key-sha256 "$NETEM_BASELINE_SELECTOR_PUBLIC_KEY_SHA256" \
   --status-authority-key-id netem-selector-status-2026-11 \
   --status-authority-public-key-sha256 "$NETEM_SELECTOR_STATUS_PUBLIC_KEY_SHA256" \
+  --release-authority-key-id netem-release-epoch-2026-11 \
+  --release-authority-public-key-sha256 "$NETEM_RELEASE_AUTHORITY_PUBLIC_KEY_SHA256" \
   --repository-id 1330973695 \
   --workflow-sha "$GITHUB_SHA" \
   --max-failure-rate-increase-basis-points 250 \
@@ -166,16 +175,20 @@ claims, enforces a maximum 24-hour authorization lifetime, and requires an exact
 baseline digest, runtime fingerprint, experiment policy, budgets, repository and workflow commit.
 It then verifies the independently pinned status authority, exact selector identity, bounded status
 freshness and `active` state before any comparison. Revoked, expired, future, substituted, or
-self-authorized status fails closed. Only then does it run the existing compatibility and regression
-checks. Exit code `0` admits the candidate, `3` retains an authenticated over-budget result, and `2`
-rejects untrusted, stale, malformed or mismatched inputs. The private receipt retains status,
-authorization, source, policy and workflow commitments plus bounded deltas—not key IDs, repository
-ID, workflow commit, signatures, raw public keys, runtime versions or probe samples.
+self-authorized status fails closed. Before those freshness checks, the gate verifies that the
+independently pinned release authority signed the exact authorization, status, baseline, candidate,
+repository and workflow binding, then uses only that signed release time. Only then does it run the
+existing compatibility and regression checks. Exit code `0` admits the candidate, `3` retains an
+authenticated over-budget result, and `2` rejects untrusted, stale, malformed or mismatched inputs.
+The private receipt retains release, status, authorization, source, policy and workflow commitments
+plus bounded deltas—not key IDs, repository ID, workflow commit, signatures, raw public keys,
+runtime versions or probe samples.
 
-This is a release authorization boundary, not key custody, authenticated time, authority quorum or
-artifact transparency. The protected workflow must separate selector and status-authority custody,
-supply a trustworthy verification time, and retain both signed envelopes and the resulting receipt
-in independently controlled immutable storage. Threshold-signed status and transparent publication
-remain future hardening steps.
+This is a release authorization boundary, not key custody, trusted hardware time, authority quorum
+or artifact transparency. The signature authenticates which release authority asserted the epoch;
+it cannot prove that authority's clock was correct. The protected workflow must separate all three
+key roles and retain the authorization, status, epoch and resulting receipt in independently
+controlled immutable storage. Threshold-signed status and transparent publication remain future
+hardening steps.
 
 
