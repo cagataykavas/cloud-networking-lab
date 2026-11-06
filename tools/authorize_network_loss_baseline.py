@@ -29,10 +29,15 @@ from tools.network_loss_evidence import (
     PartialLossBenchmarkEvidence,
     compare_partial_loss_benchmarks,
 )
+from tools.network_loss_release_epoch import (
+    ReleaseEpochRejected,
+    load_release_epoch,
+    verify_release_epoch,
+)
 
 
 AUTHORIZATION_SCHEMA = "netem-baseline-authorization/v1"
-GATE_SCHEMA = "netem-authorized-baseline-comparison/v2"
+GATE_SCHEMA = "netem-authorized-baseline-comparison/v3"
 SIGNATURE_ALGORITHM = "Ed25519"
 MAX_AUTHORIZATION_BYTES = 64 * 1024
 MAX_AUTHORIZATION_LIFETIME = timedelta(hours=24)
@@ -404,6 +409,7 @@ def verify_baseline_authorization(
 def gate_authorized_comparison(
     envelope: object,
     key_status_envelope: object,
+    release_epoch_envelope: object,
     baseline: PartialLossBenchmarkEvidence,
     candidate: PartialLossBenchmarkEvidence,
     *,
@@ -411,15 +417,47 @@ def gate_authorized_comparison(
     expected_selector_key_id: str,
     expected_status_authority_public_key_sha256: str,
     expected_status_authority_key_id: str,
+    expected_release_authority_public_key_sha256: str,
+    expected_release_authority_key_id: str,
     repository_id: str,
     workflow_sha: str,
-    verification_time: str,
     max_failure_rate_increase_basis_points: int,
     max_elapsed_increase_basis_points: int,
     signature_verifier: SignatureVerifier = verify_ed25519_signature,
     status_signature_verifier: SignatureVerifier = verify_ed25519_signature,
+    release_signature_verifier: SignatureVerifier = verify_ed25519_signature,
 ) -> tuple[dict[str, object], PartialLossBenchmarkComparison]:
     """Authorize the exact baseline and budgets before comparing the candidate."""
+    try:
+        release_audit = verify_release_epoch(
+            release_epoch_envelope,
+            expected_authorization_sha256=hashlib.sha256(
+                _canonical(envelope)
+            ).hexdigest(),
+            expected_selector_key_status_sha256=hashlib.sha256(
+                _canonical(key_status_envelope)
+            ).hexdigest(),
+            expected_baseline_benchmark_sha256=baseline.digest(),
+            expected_candidate_benchmark_sha256=candidate.digest(),
+            repository_id=repository_id,
+            workflow_sha=workflow_sha,
+            expected_release_authority_key_id=expected_release_authority_key_id,
+            expected_release_authority_public_key_sha256=(
+                expected_release_authority_public_key_sha256
+            ),
+            selector_public_key_sha256=expected_public_key_sha256,
+            status_authority_public_key_sha256=(
+                expected_status_authority_public_key_sha256
+            ),
+            selector_key_id=expected_selector_key_id,
+            status_authority_key_id=expected_status_authority_key_id,
+            signature_verifier=release_signature_verifier,
+        )
+    except ReleaseEpochRejected as exc:
+        raise BaselineAuthorizationRejected(str(exc)) from exc
+    released_at = release_audit["released_at"]
+    if not isinstance(released_at, str):
+        raise BaselineAuthorizationRejected("authenticated release time is invalid")
     audit = verify_baseline_authorization(
         envelope,
         key_status_envelope,
@@ -432,7 +470,7 @@ def gate_authorized_comparison(
         expected_status_authority_key_id=expected_status_authority_key_id,
         repository_id=repository_id,
         workflow_sha=workflow_sha,
-        verification_time=verification_time,
+        verification_time=released_at,
         max_failure_rate_increase_basis_points=max_failure_rate_increase_basis_points,
         max_elapsed_increase_basis_points=max_elapsed_increase_basis_points,
         signature_verifier=signature_verifier,
@@ -446,6 +484,7 @@ def gate_authorized_comparison(
     )
     comparison_document = comparison.as_dict()
     receipt: dict[str, object] = {
+        **release_audit,
         **audit,
         "candidate_benchmark_sha256": comparison.candidate_benchmark_sha256,
         "comparison_evidence_sha256": comparison_document["evidence_sha256"],
@@ -510,25 +549,23 @@ def load_authorization(path: Path) -> object:
         raise BaselineAuthorizationRejected("authorization is not valid JSON") from exc
 
 
-def _now_utc() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Require signed baseline selection before a netem regression gate."
     )
     parser.add_argument("authorization", type=Path)
     parser.add_argument("selector_key_status", type=Path)
+    parser.add_argument("release_epoch", type=Path)
     parser.add_argument("baseline", type=Path)
     parser.add_argument("candidate", type=Path)
     parser.add_argument("--selector-public-key-sha256", required=True)
     parser.add_argument("--selector-key-id", required=True)
     parser.add_argument("--status-authority-public-key-sha256", required=True)
     parser.add_argument("--status-authority-key-id", required=True)
+    parser.add_argument("--release-authority-public-key-sha256", required=True)
+    parser.add_argument("--release-authority-key-id", required=True)
     parser.add_argument("--repository-id", required=True)
     parser.add_argument("--workflow-sha", required=True)
-    parser.add_argument("--verification-time")
     parser.add_argument("--openssl", default="openssl")
     parser.add_argument("--timeout-seconds", type=int, default=10)
     parser.add_argument(
@@ -551,18 +588,20 @@ def main(argv: list[str] | None = None) -> int:
         inputs = {
             args.authorization.resolve(),
             args.selector_key_status.resolve(),
+            args.release_epoch.resolve(),
             args.baseline.resolve(),
             args.candidate.resolve(),
         }
-        if len(inputs) != 4:
+        if len(inputs) != 5:
             raise BaselineAuthorizationRejected(
-                "authorization, status, baseline, and candidate must be distinct files"
+                "authorization, status, epoch, baseline, and candidate must be distinct files"
             )
         if args.output is not None and args.output.resolve() in inputs:
             raise BaselineAuthorizationRejected("output must not replace gate inputs")
         receipt, comparison = gate_authorized_comparison(
             load_authorization(args.authorization),
             load_selector_key_status(args.selector_key_status),
+            load_release_epoch(args.release_epoch),
             load_evidence(args.baseline),
             load_evidence(args.candidate),
             expected_public_key_sha256=args.selector_public_key_sha256,
@@ -571,9 +610,12 @@ def main(argv: list[str] | None = None) -> int:
                 args.status_authority_public_key_sha256
             ),
             expected_status_authority_key_id=args.status_authority_key_id,
+            expected_release_authority_public_key_sha256=(
+                args.release_authority_public_key_sha256
+            ),
+            expected_release_authority_key_id=args.release_authority_key_id,
             repository_id=args.repository_id,
             workflow_sha=args.workflow_sha,
-            verification_time=args.verification_time or _now_utc(),
             max_failure_rate_increase_basis_points=(
                 args.max_failure_rate_increase_basis_points
             ),
@@ -588,6 +630,15 @@ def main(argv: list[str] | None = None) -> int:
                 )
             ),
             status_signature_verifier=lambda public_key, signature, message: (
+                verify_ed25519_signature(
+                    public_key,
+                    signature,
+                    message,
+                    executable=args.openssl,
+                    timeout_seconds=args.timeout_seconds,
+                )
+            ),
+            release_signature_verifier=lambda public_key, signature, message: (
                 verify_ed25519_signature(
                     public_key,
                     signature,

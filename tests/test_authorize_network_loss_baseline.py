@@ -33,6 +33,7 @@ from tools.network_loss_evidence import (
     ProbeOutcomeSummary,
     verify_partial_loss_benchmark,
 )
+from tools.network_loss_release_epoch import create_release_epoch
 from tools.network_loss_selector_key_status import create_selector_key_status
 
 
@@ -46,6 +47,12 @@ STATUS_AUTHORITY_PUBLIC_KEY_SHA256 = hashlib.sha256(
     STATUS_AUTHORITY_PUBLIC_KEY
 ).hexdigest()
 STATUS_AUTHORITY_KEY_ID = "netem-selector-status-2026-11"
+RELEASE_AUTHORITY_PUBLIC_KEY = b"2" * 44
+RELEASE_AUTHORITY_SIGNATURE = b"u" * 64
+RELEASE_AUTHORITY_PUBLIC_KEY_SHA256 = hashlib.sha256(
+    RELEASE_AUTHORITY_PUBLIC_KEY
+).hexdigest()
+RELEASE_AUTHORITY_KEY_ID = "netem-release-epoch-2026-11"
 REPOSITORY_ID = "1330973695"
 WORKFLOW_SHA = "a" * 40
 ISSUED_AT = "2026-11-05T16:00:00Z"
@@ -132,6 +139,39 @@ def status_envelope(**overrides: object) -> dict[str, object]:
     return create_selector_key_status(**parameters)
 
 
+def canonical(value: object) -> bytes:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+
+
+def release_epoch(
+    authorization: object,
+    status: object,
+    baseline: PartialLossBenchmarkEvidence,
+    candidate: PartialLossBenchmarkEvidence,
+    **overrides: object,
+) -> dict[str, object]:
+    parameters = {
+        "authorization_sha256": hashlib.sha256(canonical(authorization)).hexdigest(),
+        "selector_key_status_sha256": hashlib.sha256(canonical(status)).hexdigest(),
+        "baseline_benchmark_sha256": baseline.digest(),
+        "candidate_benchmark_sha256": candidate.digest(),
+        "repository_id": REPOSITORY_ID,
+        "workflow_sha": WORKFLOW_SHA,
+        "release_authority_key_id": RELEASE_AUTHORITY_KEY_ID,
+        "released_at": VERIFICATION_TIME,
+        "public_key_der": RELEASE_AUTHORITY_PUBLIC_KEY,
+        "signer": lambda message: RELEASE_AUTHORITY_SIGNATURE if message else b"",
+    }
+    parameters.update(overrides)
+    return create_release_epoch(**parameters)
+
+
 def verify(
     document: object,
     baseline: PartialLossBenchmarkEvidence | None = None,
@@ -171,9 +211,12 @@ def verify(
 def test_authorizes_exact_baseline_before_releasing_private_comparison() -> None:
     baseline = benchmark()
     candidate = benchmark(failures=5, elapsed_ms=770)
+    authorization = envelope(baseline)
+    status = status_envelope()
     receipt, comparison = gate_authorized_comparison(
-        envelope(baseline),
-        status_envelope(),
+        authorization,
+        status,
+        release_epoch(authorization, status, baseline, candidate),
         baseline,
         candidate,
         expected_public_key_sha256=PUBLIC_KEY_SHA256,
@@ -182,13 +225,17 @@ def test_authorizes_exact_baseline_before_releasing_private_comparison() -> None
             STATUS_AUTHORITY_PUBLIC_KEY_SHA256
         ),
         expected_status_authority_key_id=STATUS_AUTHORITY_KEY_ID,
+        expected_release_authority_public_key_sha256=(
+            RELEASE_AUTHORITY_PUBLIC_KEY_SHA256
+        ),
+        expected_release_authority_key_id=RELEASE_AUTHORITY_KEY_ID,
         repository_id=REPOSITORY_ID,
         workflow_sha=WORKFLOW_SHA,
-        verification_time=VERIFICATION_TIME,
         max_failure_rate_increase_basis_points=FAILURE_BUDGET,
         max_elapsed_increase_basis_points=ELAPSED_BUDGET,
         signature_verifier=lambda *_: True,
         status_signature_verifier=lambda *_: True,
+        release_signature_verifier=lambda *_: True,
     )
 
     assert comparison.accepted
@@ -198,15 +245,60 @@ def test_authorizes_exact_baseline_before_releasing_private_comparison() -> None
     assert receipt["candidate_benchmark_sha256"] == candidate.digest()
     assert len(receipt["authorization_sha256"]) == 64
     assert len(receipt["selector_key_status_sha256"]) == 64
+    assert len(receipt["release_epoch_sha256"]) == 64
     assert len(receipt["workflow_binding_sha256"]) == 64
     retained = json.dumps(receipt, sort_keys=True)
     assert REPOSITORY_ID not in retained
     assert WORKFLOW_SHA not in retained
     assert KEY_ID not in retained
     assert STATUS_AUTHORITY_KEY_ID not in retained
+    assert RELEASE_AUTHORITY_KEY_ID not in retained
     assert base64.b64encode(SIGNATURE).decode("ascii") not in retained
     assert base64.b64encode(PUBLIC_KEY).decode("ascii") not in retained
     assert base64.b64encode(STATUS_AUTHORITY_PUBLIC_KEY).decode("ascii") not in retained
+    assert (
+        base64.b64encode(RELEASE_AUTHORITY_PUBLIC_KEY).decode("ascii") not in retained
+    )
+
+
+def test_signed_release_time_controls_authorization_freshness() -> None:
+    baseline = benchmark()
+    candidate = benchmark(failures=5, elapsed_ms=770)
+    authorization = envelope(baseline)
+    status = status_envelope()
+    expired_epoch = release_epoch(
+        authorization,
+        status,
+        baseline,
+        candidate,
+        released_at=EXPIRES_AT,
+    )
+
+    with pytest.raises(BaselineAuthorizationRejected, match="expired"):
+        gate_authorized_comparison(
+            authorization,
+            status,
+            expired_epoch,
+            baseline,
+            candidate,
+            expected_public_key_sha256=PUBLIC_KEY_SHA256,
+            expected_selector_key_id=KEY_ID,
+            expected_status_authority_public_key_sha256=(
+                STATUS_AUTHORITY_PUBLIC_KEY_SHA256
+            ),
+            expected_status_authority_key_id=STATUS_AUTHORITY_KEY_ID,
+            expected_release_authority_public_key_sha256=(
+                RELEASE_AUTHORITY_PUBLIC_KEY_SHA256
+            ),
+            expected_release_authority_key_id=RELEASE_AUTHORITY_KEY_ID,
+            repository_id=REPOSITORY_ID,
+            workflow_sha=WORKFLOW_SHA,
+            max_failure_rate_increase_basis_points=FAILURE_BUDGET,
+            max_elapsed_increase_basis_points=ELAPSED_BUDGET,
+            signature_verifier=lambda *_: True,
+            status_signature_verifier=lambda *_: True,
+            release_signature_verifier=lambda *_: True,
+        )
 
 
 @pytest.mark.parametrize(
@@ -379,6 +471,7 @@ def test_real_ed25519_signature_and_cli_gate(tmp_path: Path) -> None:
 
     public_key_der, sign = key_pair("selector")
     authority_public_key_der, sign_status = key_pair("status-authority")
+    release_public_key_der, sign_release = key_pair("release-authority")
 
     baseline_evidence = benchmark()
     candidate_evidence = benchmark(failures=5, elapsed_ms=770)
@@ -392,13 +485,23 @@ def test_real_ed25519_signature_and_cli_gate(tmp_path: Path) -> None:
         authority_public_key_der=authority_public_key_der,
         signer=sign_status,
     )
+    signed_epoch = release_epoch(
+        signed,
+        signed_status,
+        baseline_evidence,
+        candidate_evidence,
+        public_key_der=release_public_key_der,
+        signer=sign_release,
+    )
     authorization_path = tmp_path / "authorization.json"
     status_path = tmp_path / "selector-key-status.json"
+    epoch_path = tmp_path / "release-epoch.json"
     baseline_path = tmp_path / "baseline.json"
     candidate_path = tmp_path / "candidate.json"
     output_path = tmp_path / "gate.json"
     authorization_path.write_text(json.dumps(signed), encoding="utf-8")
     status_path.write_text(json.dumps(signed_status), encoding="utf-8")
+    epoch_path.write_text(json.dumps(signed_epoch), encoding="utf-8")
     baseline_path.write_text(json.dumps(baseline_evidence.as_dict()), encoding="utf-8")
     candidate_path.write_text(
         json.dumps(candidate_evidence.as_dict()), encoding="utf-8"
@@ -407,6 +510,7 @@ def test_real_ed25519_signature_and_cli_gate(tmp_path: Path) -> None:
     arguments = [
         str(authorization_path),
         str(status_path),
+        str(epoch_path),
         str(baseline_path),
         str(candidate_path),
         "--selector-public-key-sha256",
@@ -417,12 +521,14 @@ def test_real_ed25519_signature_and_cli_gate(tmp_path: Path) -> None:
         hashlib.sha256(authority_public_key_der).hexdigest(),
         "--status-authority-key-id",
         STATUS_AUTHORITY_KEY_ID,
+        "--release-authority-public-key-sha256",
+        hashlib.sha256(release_public_key_der).hexdigest(),
+        "--release-authority-key-id",
+        RELEASE_AUTHORITY_KEY_ID,
         "--repository-id",
         REPOSITORY_ID,
         "--workflow-sha",
         WORKFLOW_SHA,
-        "--verification-time",
-        VERIFICATION_TIME,
         "--output",
         str(output_path),
     ]
@@ -431,8 +537,22 @@ def test_real_ed25519_signature_and_cli_gate(tmp_path: Path) -> None:
     assert json.loads(output_path.read_text(encoding="utf-8"))["status"] == "pass"
     assert os.stat(output_path).st_mode & 0o777 == 0o600
 
+    rejected_candidate = benchmark(failures=12, elapsed_ms=900)
     candidate_path.write_text(
-        json.dumps(benchmark(failures=12, elapsed_ms=900).as_dict()),
+        json.dumps(rejected_candidate.as_dict()), encoding="utf-8"
+    )
+    assert main(arguments) == 2
+    epoch_path.write_text(
+        json.dumps(
+            release_epoch(
+                signed,
+                signed_status,
+                baseline_evidence,
+                rejected_candidate,
+                public_key_der=release_public_key_der,
+                signer=sign_release,
+            )
+        ),
         encoding="utf-8",
     )
     assert main(arguments) == 3
