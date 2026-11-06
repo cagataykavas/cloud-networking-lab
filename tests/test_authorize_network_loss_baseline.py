@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -32,12 +33,19 @@ from tools.network_loss_evidence import (
     ProbeOutcomeSummary,
     verify_partial_loss_benchmark,
 )
+from tools.network_loss_selector_key_status import create_selector_key_status
 
 
 PUBLIC_KEY = b"0" * 44
 SIGNATURE = b"s" * 64
 PUBLIC_KEY_SHA256 = hashlib.sha256(PUBLIC_KEY).hexdigest()
 KEY_ID = "netem-baseline-review-2026-11"
+STATUS_AUTHORITY_PUBLIC_KEY = b"1" * 44
+STATUS_AUTHORITY_SIGNATURE = b"t" * 64
+STATUS_AUTHORITY_PUBLIC_KEY_SHA256 = hashlib.sha256(
+    STATUS_AUTHORITY_PUBLIC_KEY
+).hexdigest()
+STATUS_AUTHORITY_KEY_ID = "netem-selector-status-2026-11"
 REPOSITORY_ID = "1330973695"
 WORKFLOW_SHA = "a" * 40
 ISSUED_AT = "2026-11-05T16:00:00Z"
@@ -109,6 +117,21 @@ def envelope(
     return create_baseline_authorization(baseline or benchmark(), **parameters)
 
 
+def status_envelope(**overrides: object) -> dict[str, object]:
+    parameters = {
+        "selector_key_id": KEY_ID,
+        "selector_public_key_sha256": PUBLIC_KEY_SHA256,
+        "state": "active",
+        "status_authority_key_id": STATUS_AUTHORITY_KEY_ID,
+        "issued_at": ISSUED_AT,
+        "expires_at": EXPIRES_AT,
+        "authority_public_key_der": STATUS_AUTHORITY_PUBLIC_KEY,
+        "signer": lambda message: STATUS_AUTHORITY_SIGNATURE if message else b"",
+    }
+    parameters.update(overrides)
+    return create_selector_key_status(**parameters)
+
+
 def verify(
     document: object,
     baseline: PartialLossBenchmarkEvidence | None = None,
@@ -117,6 +140,10 @@ def verify(
     parameters = {
         "expected_public_key_sha256": PUBLIC_KEY_SHA256,
         "expected_selector_key_id": KEY_ID,
+        "expected_status_authority_public_key_sha256": (
+            STATUS_AUTHORITY_PUBLIC_KEY_SHA256
+        ),
+        "expected_status_authority_key_id": STATUS_AUTHORITY_KEY_ID,
         "repository_id": REPOSITORY_ID,
         "workflow_sha": WORKFLOW_SHA,
         "verification_time": VERIFICATION_TIME,
@@ -125,10 +152,17 @@ def verify(
         "signature_verifier": lambda public_key, signature, message: (
             public_key == PUBLIC_KEY and signature == SIGNATURE and bool(message)
         ),
+        "status_signature_verifier": lambda public_key, signature, message: (
+            public_key == STATUS_AUTHORITY_PUBLIC_KEY
+            and signature == STATUS_AUTHORITY_SIGNATURE
+            and bool(message)
+        ),
     }
+    key_status = overrides.pop("key_status_envelope", status_envelope())
     parameters.update(overrides)
     return verify_baseline_authorization(
         document,
+        key_status,
         baseline or benchmark(),
         **parameters,
     )
@@ -139,16 +173,22 @@ def test_authorizes_exact_baseline_before_releasing_private_comparison() -> None
     candidate = benchmark(failures=5, elapsed_ms=770)
     receipt, comparison = gate_authorized_comparison(
         envelope(baseline),
+        status_envelope(),
         baseline,
         candidate,
         expected_public_key_sha256=PUBLIC_KEY_SHA256,
         expected_selector_key_id=KEY_ID,
+        expected_status_authority_public_key_sha256=(
+            STATUS_AUTHORITY_PUBLIC_KEY_SHA256
+        ),
+        expected_status_authority_key_id=STATUS_AUTHORITY_KEY_ID,
         repository_id=REPOSITORY_ID,
         workflow_sha=WORKFLOW_SHA,
         verification_time=VERIFICATION_TIME,
         max_failure_rate_increase_basis_points=FAILURE_BUDGET,
         max_elapsed_increase_basis_points=ELAPSED_BUDGET,
         signature_verifier=lambda *_: True,
+        status_signature_verifier=lambda *_: True,
     )
 
     assert comparison.accepted
@@ -157,12 +197,16 @@ def test_authorizes_exact_baseline_before_releasing_private_comparison() -> None
     assert receipt["baseline_benchmark_sha256"] == baseline.digest()
     assert receipt["candidate_benchmark_sha256"] == candidate.digest()
     assert len(receipt["authorization_sha256"]) == 64
+    assert len(receipt["selector_key_status_sha256"]) == 64
     assert len(receipt["workflow_binding_sha256"]) == 64
     retained = json.dumps(receipt, sort_keys=True)
     assert REPOSITORY_ID not in retained
     assert WORKFLOW_SHA not in retained
+    assert KEY_ID not in retained
+    assert STATUS_AUTHORITY_KEY_ID not in retained
     assert base64.b64encode(SIGNATURE).decode("ascii") not in retained
     assert base64.b64encode(PUBLIC_KEY).decode("ascii") not in retained
+    assert base64.b64encode(STATUS_AUTHORITY_PUBLIC_KEY).decode("ascii") not in retained
 
 
 @pytest.mark.parametrize(
@@ -214,6 +258,24 @@ def test_signature_is_checked_before_signed_claims_or_candidate_comparison(
         verify(document, signature_verifier=lambda *_: False)
 
 
+def test_revoked_selector_key_blocks_comparison_before_semantic_use(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authorization = envelope()
+    revoked_status = status_envelope(state="revoked")
+
+    def comparison_must_not_run(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("comparison ran after selector-key revocation")
+
+    monkeypatch.setattr(
+        authorization_module,
+        "compare_partial_loss_benchmarks",
+        comparison_must_not_run,
+    )
+    with pytest.raises(ValueError, match="selector key is revoked"):
+        verify(authorization, key_status_envelope=revoked_status)
+
+
 @pytest.mark.parametrize(
     ("verification_time", "message"),
     [
@@ -260,52 +322,63 @@ def test_loader_rejects_duplicate_keys_and_symlinks(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="OpenSSL is unavailable")
 def test_real_ed25519_signature_and_cli_gate(tmp_path: Path) -> None:
-    private_key = tmp_path / "selector-private.pem"
-    public_key = tmp_path / "selector-public.der"
-    subprocess.run(
-        ["openssl", "genpkey", "-algorithm", "ED25519", "-out", str(private_key)],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        [
-            "openssl",
-            "pkey",
-            "-in",
-            str(private_key),
-            "-pubout",
-            "-outform",
-            "DER",
-            "-out",
-            str(public_key),
-        ],
-        check=True,
-        capture_output=True,
-    )
-    public_key_der = public_key.read_bytes()
-
-    def sign(message: bytes) -> bytes:
-        message_path = tmp_path / "authorization-message.bin"
-        signature_path = tmp_path / "authorization-signature.bin"
-        message_path.write_bytes(message)
-        completed = subprocess.run(
+    def key_pair(name: str) -> tuple[bytes, Callable[[bytes], bytes]]:
+        private_key = tmp_path / f"{name}-private.pem"
+        public_key = tmp_path / f"{name}-public.der"
+        subprocess.run(
             [
                 "openssl",
-                "pkeyutl",
-                "-sign",
-                "-inkey",
-                str(private_key),
-                "-rawin",
-                "-in",
-                str(message_path),
+                "genpkey",
+                "-algorithm",
+                "ED25519",
                 "-out",
-                str(signature_path),
+                str(private_key),
             ],
             check=True,
             capture_output=True,
         )
-        assert completed.returncode == 0
-        return signature_path.read_bytes()
+        subprocess.run(
+            [
+                "openssl",
+                "pkey",
+                "-in",
+                str(private_key),
+                "-pubout",
+                "-outform",
+                "DER",
+                "-out",
+                str(public_key),
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+        def sign(message: bytes) -> bytes:
+            message_path = tmp_path / f"{name}-message.bin"
+            signature_path = tmp_path / f"{name}-signature.bin"
+            message_path.write_bytes(message)
+            subprocess.run(
+                [
+                    "openssl",
+                    "pkeyutl",
+                    "-sign",
+                    "-inkey",
+                    str(private_key),
+                    "-rawin",
+                    "-in",
+                    str(message_path),
+                    "-out",
+                    str(signature_path),
+                ],
+                check=True,
+                capture_output=True,
+            )
+            return signature_path.read_bytes()
+
+        return public_key.read_bytes(), sign
+
+    public_key_der, sign = key_pair("selector")
+    authority_public_key_der, sign_status = key_pair("status-authority")
 
     baseline_evidence = benchmark()
     candidate_evidence = benchmark(failures=5, elapsed_ms=770)
@@ -314,11 +387,18 @@ def test_real_ed25519_signature_and_cli_gate(tmp_path: Path) -> None:
         public_key_der=public_key_der,
         signer=sign,
     )
+    signed_status = status_envelope(
+        selector_public_key_sha256=hashlib.sha256(public_key_der).hexdigest(),
+        authority_public_key_der=authority_public_key_der,
+        signer=sign_status,
+    )
     authorization_path = tmp_path / "authorization.json"
+    status_path = tmp_path / "selector-key-status.json"
     baseline_path = tmp_path / "baseline.json"
     candidate_path = tmp_path / "candidate.json"
     output_path = tmp_path / "gate.json"
     authorization_path.write_text(json.dumps(signed), encoding="utf-8")
+    status_path.write_text(json.dumps(signed_status), encoding="utf-8")
     baseline_path.write_text(json.dumps(baseline_evidence.as_dict()), encoding="utf-8")
     candidate_path.write_text(
         json.dumps(candidate_evidence.as_dict()), encoding="utf-8"
@@ -326,12 +406,17 @@ def test_real_ed25519_signature_and_cli_gate(tmp_path: Path) -> None:
 
     arguments = [
         str(authorization_path),
+        str(status_path),
         str(baseline_path),
         str(candidate_path),
         "--selector-public-key-sha256",
         hashlib.sha256(public_key_der).hexdigest(),
         "--selector-key-id",
         KEY_ID,
+        "--status-authority-public-key-sha256",
+        hashlib.sha256(authority_public_key_der).hexdigest(),
+        "--status-authority-key-id",
+        STATUS_AUTHORITY_KEY_ID,
         "--repository-id",
         REPOSITORY_ID,
         "--workflow-sha",

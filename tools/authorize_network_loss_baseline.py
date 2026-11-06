@@ -19,6 +19,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from tools.compare_network_loss_evidence import load_evidence, write_receipt
+from tools.network_loss_selector_key_status import (
+    SelectorKeyStatusRejected,
+    load_selector_key_status,
+    verify_selector_key_status,
+)
 from tools.network_loss_evidence import (
     PartialLossBenchmarkComparison,
     PartialLossBenchmarkEvidence,
@@ -27,7 +32,7 @@ from tools.network_loss_evidence import (
 
 
 AUTHORIZATION_SCHEMA = "netem-baseline-authorization/v1"
-GATE_SCHEMA = "netem-authorized-baseline-comparison/v1"
+GATE_SCHEMA = "netem-authorized-baseline-comparison/v2"
 SIGNATURE_ALGORITHM = "Ed25519"
 MAX_AUTHORIZATION_BYTES = 64 * 1024
 MAX_AUTHORIZATION_LIFETIME = timedelta(hours=24)
@@ -270,16 +275,20 @@ def verify_ed25519_signature(
 
 def verify_baseline_authorization(
     envelope: object,
+    key_status_envelope: object,
     baseline: PartialLossBenchmarkEvidence,
     *,
     expected_public_key_sha256: str,
     expected_selector_key_id: str,
+    expected_status_authority_public_key_sha256: str,
+    expected_status_authority_key_id: str,
     repository_id: str,
     workflow_sha: str,
     verification_time: str,
     max_failure_rate_increase_basis_points: int,
     max_elapsed_increase_basis_points: int,
     signature_verifier: SignatureVerifier = verify_ed25519_signature,
+    status_signature_verifier: SignatureVerifier = verify_ed25519_signature,
 ) -> dict[str, object]:
     """Verify the signature, trusted identity, freshness, and exact gate selection."""
     if not isinstance(envelope, dict) or set(envelope) != _TOP_LEVEL_FIELDS:
@@ -335,6 +344,21 @@ def verify_baseline_authorization(
     if signature_valid is not True:
         raise BaselineAuthorizationRejected("selector signature is invalid")
 
+    try:
+        status_audit = verify_selector_key_status(
+            key_status_envelope,
+            expected_selector_key_id=expected_selector_key_id,
+            expected_selector_public_key_sha256=key_digest,
+            expected_status_authority_key_id=expected_status_authority_key_id,
+            expected_status_authority_public_key_sha256=(
+                expected_status_authority_public_key_sha256
+            ),
+            verification_time=verification_time,
+            signature_verifier=status_signature_verifier,
+        )
+    except SelectorKeyStatusRejected as exc:
+        raise BaselineAuthorizationRejected(str(exc)) from exc
+
     expected_claims = _authorization_claims(
         baseline,
         max_failure_rate_increase_basis_points=max_failure_rate_increase_basis_points,
@@ -361,12 +385,15 @@ def verify_baseline_authorization(
         "workflow_sha": workflow_sha,
     }
     return {
+        **status_audit,
         "authorization_sha256": hashlib.sha256(_canonical(envelope)).hexdigest(),
         "authorized_until": authorization["expires_at"],
         "baseline_benchmark_sha256": authorization["baseline_benchmark_sha256"],
         "policy_sha256": authorization["policy_sha256"],
         "runtime_fingerprint_sha256": authorization["runtime_fingerprint_sha256"],
-        "selector_key_id": expected_selector_key_id,
+        "selector_key_id_sha256": hashlib.sha256(
+            expected_selector_key_id.encode("utf-8")
+        ).hexdigest(),
         "selector_public_key_sha256": key_digest,
         "status": "authorized",
         "verified_at": verification_time,
@@ -376,30 +403,40 @@ def verify_baseline_authorization(
 
 def gate_authorized_comparison(
     envelope: object,
+    key_status_envelope: object,
     baseline: PartialLossBenchmarkEvidence,
     candidate: PartialLossBenchmarkEvidence,
     *,
     expected_public_key_sha256: str,
     expected_selector_key_id: str,
+    expected_status_authority_public_key_sha256: str,
+    expected_status_authority_key_id: str,
     repository_id: str,
     workflow_sha: str,
     verification_time: str,
     max_failure_rate_increase_basis_points: int,
     max_elapsed_increase_basis_points: int,
     signature_verifier: SignatureVerifier = verify_ed25519_signature,
+    status_signature_verifier: SignatureVerifier = verify_ed25519_signature,
 ) -> tuple[dict[str, object], PartialLossBenchmarkComparison]:
     """Authorize the exact baseline and budgets before comparing the candidate."""
     audit = verify_baseline_authorization(
         envelope,
+        key_status_envelope,
         baseline,
         expected_public_key_sha256=expected_public_key_sha256,
         expected_selector_key_id=expected_selector_key_id,
+        expected_status_authority_public_key_sha256=(
+            expected_status_authority_public_key_sha256
+        ),
+        expected_status_authority_key_id=expected_status_authority_key_id,
         repository_id=repository_id,
         workflow_sha=workflow_sha,
         verification_time=verification_time,
         max_failure_rate_increase_basis_points=max_failure_rate_increase_basis_points,
         max_elapsed_increase_basis_points=max_elapsed_increase_basis_points,
         signature_verifier=signature_verifier,
+        status_signature_verifier=status_signature_verifier,
     )
     comparison = compare_partial_loss_benchmarks(
         baseline,
@@ -482,10 +519,13 @@ def _parser() -> argparse.ArgumentParser:
         description="Require signed baseline selection before a netem regression gate."
     )
     parser.add_argument("authorization", type=Path)
+    parser.add_argument("selector_key_status", type=Path)
     parser.add_argument("baseline", type=Path)
     parser.add_argument("candidate", type=Path)
     parser.add_argument("--selector-public-key-sha256", required=True)
     parser.add_argument("--selector-key-id", required=True)
+    parser.add_argument("--status-authority-public-key-sha256", required=True)
+    parser.add_argument("--status-authority-key-id", required=True)
     parser.add_argument("--repository-id", required=True)
     parser.add_argument("--workflow-sha", required=True)
     parser.add_argument("--verification-time")
@@ -510,21 +550,27 @@ def main(argv: list[str] | None = None) -> int:
     try:
         inputs = {
             args.authorization.resolve(),
+            args.selector_key_status.resolve(),
             args.baseline.resolve(),
             args.candidate.resolve(),
         }
-        if len(inputs) != 3:
+        if len(inputs) != 4:
             raise BaselineAuthorizationRejected(
-                "authorization, baseline, and candidate must be distinct files"
+                "authorization, status, baseline, and candidate must be distinct files"
             )
         if args.output is not None and args.output.resolve() in inputs:
             raise BaselineAuthorizationRejected("output must not replace gate inputs")
         receipt, comparison = gate_authorized_comparison(
             load_authorization(args.authorization),
+            load_selector_key_status(args.selector_key_status),
             load_evidence(args.baseline),
             load_evidence(args.candidate),
             expected_public_key_sha256=args.selector_public_key_sha256,
             expected_selector_key_id=args.selector_key_id,
+            expected_status_authority_public_key_sha256=(
+                args.status_authority_public_key_sha256
+            ),
+            expected_status_authority_key_id=args.status_authority_key_id,
             repository_id=args.repository_id,
             workflow_sha=args.workflow_sha,
             verification_time=args.verification_time or _now_utc(),
@@ -533,6 +579,15 @@ def main(argv: list[str] | None = None) -> int:
             ),
             max_elapsed_increase_basis_points=(args.max_elapsed_increase_basis_points),
             signature_verifier=lambda public_key, signature, message: (
+                verify_ed25519_signature(
+                    public_key,
+                    signature,
+                    message,
+                    executable=args.openssl,
+                    timeout_seconds=args.timeout_seconds,
+                )
+            ),
+            status_signature_verifier=lambda public_key, signature, message: (
                 verify_ed25519_signature(
                     public_key,
                     signature,
