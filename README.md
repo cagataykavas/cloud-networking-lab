@@ -72,6 +72,7 @@ This makes proxy retry/failover behavior visible. The Nginx config uses connecti
 | `tools/authorize_network_loss_baseline.py` | Ed25519-reviewed baseline selection and protected-workflow comparison gate |
 | `tools/network_loss_selector_key_status.py` | independently signed selector-key freshness and revocation status |
 | `tools/network_loss_release_epoch.py` | authenticated release time bound to one exact netem gate |
+| `tools/archive_network_loss_release.py` | content-addressed S3 Object Lock publication for accepted netem releases |
 | `tools/redis_sentinel_election_drill.py` | three-Sentinel partition, impaired healing and stale-head fence drill |
 | `docs/redis_replay_guard.md` | Redis Cluster slotting, same-connection `WAIT`, durability and failover boundaries |
 | `docker-compose.yml` | edge/private network segmentation and service discovery by DNS name |
@@ -184,11 +185,47 @@ The private receipt retains release, status, authorization, source, policy and w
 plus bounded deltas—not key IDs, repository ID, workflow commit, signatures, raw public keys,
 runtime versions or probe samples.
 
-This is a release authorization boundary, not key custody, trusted hardware time, authority quorum
-or artifact transparency. The signature authenticates which release authority asserted the epoch;
-it cannot prove that authority's clock was correct. The protected workflow must separate all three
-key roles and retain the authorization, status, epoch and resulting receipt in independently
-controlled immutable storage. Threshold-signed status and transparent publication remain future
-hardening steps.
+For durable evidence, run the archive command only from a protected release environment with an
+AWS role scoped to one dedicated bucket and prefix. The command re-runs the complete authenticated
+gate before creating an AWS client, refuses over-budget releases, checks versioning, Object Lock,
+and all four bucket public-access blocks, then writes one canonical content-addressed bundle. It
+uses a conditional create, a caller-pinned bucket owner, SHA-256 transport checksum, a caller-pinned
+KMS key ARN, and per-object `COMPLIANCE` retention. Finally, it reads the exact returned version's
+size, checksum, mode, and retention timestamp before emitting a privacy-reduced local receipt.
+
+```bash
+python -m tools.archive_network_loss_release \
+  baseline-authorization.json selector-key-status.json release-epoch.json \
+  baseline-benchmark.json candidate-benchmark.json \
+  --selector-key-id netem-baseline-review-2026-11 \
+  --selector-public-key-sha256 "$NETEM_BASELINE_SELECTOR_PUBLIC_KEY_SHA256" \
+  --status-authority-key-id netem-selector-status-2026-11 \
+  --status-authority-public-key-sha256 "$NETEM_SELECTOR_STATUS_PUBLIC_KEY_SHA256" \
+  --release-authority-key-id netem-release-epoch-2026-11 \
+  --release-authority-public-key-sha256 "$NETEM_RELEASE_AUTHORITY_PUBLIC_KEY_SHA256" \
+  --repository-id 1330973695 \
+  --workflow-sha "$GITHUB_SHA" \
+  --bucket private-netem-release-archive \
+  --expected-bucket-owner 123456789012 \
+  --kms-key-arn \
+    arn:aws:kms:eu-central-1:123456789012:key/12345678-1234-1234-1234-123456789abc \
+  --aws-region eu-central-1 \
+  --retention-days 365 \
+  --output release-archive-receipt.json
+```
+
+The S3 bucket must have versioning and Object Lock enabled at creation time, with bucket-level
+public access fully blocked. The release role needs only the bucket-control reads, object create,
+exact-version attribute/retention reads, and KMS encryption permissions required by this flow;
+deny unencrypted writes and writes outside the configured prefix in bucket policy. Keep delete,
+retention changes, bucket administration, and KMS administration out of the release role. Test
+policy and retention settings in a disposable account first: S3 Object Lock `COMPLIANCE` retention
+cannot be shortened or bypassed, including by the root user.
+
+This is a release authorization and immutable-retention boundary, not key custody, trusted hardware
+time, authority quorum, cross-account replication, or public artifact transparency. The signature
+authenticates which release authority asserted the epoch; it cannot prove that authority's clock
+was correct. The protected workflow must still separate all three signing roles from the archive
+role. Threshold-signed status and transparent publication remain future hardening steps.
 
 
