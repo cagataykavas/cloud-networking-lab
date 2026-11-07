@@ -73,6 +73,7 @@ This makes proxy retry/failover behavior visible. The Nginx config uses connecti
 | `tools/network_loss_selector_key_status.py` | independently signed selector-key freshness and revocation status |
 | `tools/network_loss_release_epoch.py` | authenticated release time bound to one exact netem gate |
 | `tools/archive_network_loss_release.py` | content-addressed S3 Object Lock publication for accepted netem releases |
+| `tools/audit_network_loss_release_archive.py` | exact-version recovery, retention validation, and independent release-gate replay |
 | `tools/redis_sentinel_election_drill.py` | three-Sentinel partition, impaired healing and stale-head fence drill |
 | `docs/redis_replay_guard.md` | Redis Cluster slotting, same-connection `WAIT`, durability and failover boundaries |
 | `docker-compose.yml` | edge/private network segmentation and service discovery by DNS name |
@@ -221,6 +222,41 @@ deny unencrypted writes and writes outside the configured prefix in bucket polic
 retention changes, bucket administration, and KMS administration out of the release role. Test
 policy and retention settings in a disposable account first: S3 Object Lock `COMPLIANCE` retention
 cannot be shortened or bypassed, including by the root user.
+
+Audit a receipt from a separate, read-only role before relying on the archived decision. The
+auditor validates the receipt and its private bucket/KMS commitments before creating an AWS
+client, fetches only the receipt's exact object version with checksum mode enabled, and caps the
+response body at 2 MiB. It then verifies the canonical bundle digest, content type, metadata,
+bucket-key encryption, pinned KMS key, and active `COMPLIANCE` retention. Finally, it reconstructs
+both benchmark records and re-runs the full three-authority release gate using the caller's pinned
+identities and budgets. Its self-digested receipt contains only commitments—not the bucket, key,
+KMS ARN, raw version ID, signatures, or bundle.
+
+```bash
+python -m tools.audit_network_loss_release_archive release-archive-receipt.json \
+  --selector-key-id netem-baseline-review-2026-11 \
+  --selector-public-key-sha256 "$NETEM_BASELINE_SELECTOR_PUBLIC_KEY_SHA256" \
+  --status-authority-key-id netem-selector-status-2026-11 \
+  --status-authority-public-key-sha256 "$NETEM_SELECTOR_STATUS_PUBLIC_KEY_SHA256" \
+  --release-authority-key-id netem-release-epoch-2026-11 \
+  --release-authority-public-key-sha256 "$NETEM_RELEASE_AUTHORITY_PUBLIC_KEY_SHA256" \
+  --repository-id 1330973695 \
+  --workflow-sha "$GITHUB_SHA" \
+  --bucket private-netem-release-archive \
+  --expected-bucket-owner 123456789012 \
+  --kms-key-arn \
+    arn:aws:kms:eu-central-1:123456789012:key/12345678-1234-1234-1234-123456789abc \
+  --aws-region eu-central-1 \
+  --output release-archive-audit.json
+```
+
+The audit deliberately fails once retention has expired; it proves that the exact accepted bundle
+is still recoverable under an active immutable-retention guarantee, not merely that old bytes can
+be read. Run it with `s3:GetObjectVersion`, `s3:GetObjectRetention`, and the minimum KMS decrypt
+permissions for the one archive prefix. It does not verify replication, bucket policy, KMS policy,
+CloudTrail delivery, or AWS account
+ownership beyond S3's expected-owner check; exercise those controls separately in disposable
+infrastructure and keep the auditor role independent from release and archive writers.
 
 This is a release authorization and immutable-retention boundary, not key custody, trusted hardware
 time, authority quorum, cross-account replication, or public artifact transparency. The signature
