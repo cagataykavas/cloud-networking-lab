@@ -57,6 +57,8 @@ This makes proxy retry/failover behavior visible. The Nginx config uses connecti
 | `tools/proxy_v2.py` | strict, deadline-aware PROXY v2 admission before application parsing |
 | `tools/replay_guard.py` | bounded, thread-safe TTL claims for PROXY unique-ID replay rejection |
 | `docs/proxy_v2_replay_guard.md` | replay threat model, sizing and multi-process boundary |
+| `tools/proxy_v2_receipt_ledger.py` | authenticated, hash-chained retention with rollback checkpoints |
+| `docs/proxy_protocol_v2.md` | pinned HAProxy interoperability and receipt-ledger trust boundaries |
 | `docker-compose.yml` | edge/private network segmentation and service discovery by DNS name |
 
 ## Interview map
