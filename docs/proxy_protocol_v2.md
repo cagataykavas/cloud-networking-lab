@@ -143,9 +143,11 @@ capabilities, and set `no-new-privileges`.
 Run the same boundary as CI:
 
 ```bash
-docker compose -f docker-compose.proxy-v2.yml up -d --build \
+docker compose -f docker-compose.proxy-v2.yml build \
+  proxy_v2_backend proxy_v2_probe
+docker compose -f docker-compose.proxy-v2.yml up -d --no-build \
   proxy_v2_backend haproxy_proxy_v2
-docker compose -f docker-compose.proxy-v2.yml run --build --rm --no-deps proxy_v2_probe \
+docker compose -f docker-compose.proxy-v2.yml run --rm --no-deps proxy_v2_probe \
   | tee proxy-v2-loopback.json
 python -m tools.proxy_v2_loopback verify-receipt proxy-v2-loopback.json \
   --payload-hex 70726f78792d76322d6170706c69636174696f6e2d6672616d650a
