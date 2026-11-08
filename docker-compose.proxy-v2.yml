@@ -1,0 +1,76 @@
+name: proxy-v2-loopback
+
+x-fixture-service: &fixture-service
+  build:
+    context: .
+    dockerfile: tests/fixtures/proxy_v2/Dockerfile
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  networks:
+    proxy_v2_fixture: {}
+
+services:
+  proxy_v2_backend:
+    <<: *fixture-service
+    command:
+      - serve
+      - --port
+      - "9000"
+      - --trusted-proxy-cidr
+      - 172.31.254.20/32
+      - --destination-cidr
+      - 172.31.254.20/32
+      - --destination-port
+      - "8080"
+      - --expected-payload-hex
+      - 70726f78792d76322d6170706c69636174696f6e2d6672616d650a
+    networks:
+      proxy_v2_fixture:
+        ipv4_address: 172.31.254.10
+
+  haproxy_proxy_v2:
+    image: haproxy:3.2.26-alpine3.24@sha256:b715bb31981ee0810e9105e5bbc58c37ded574fe92af75277bc7f4c8e2208143
+    depends_on:
+      - proxy_v2_backend
+    read_only: true
+    tmpfs:
+      - /run
+      - /var/lib/haproxy
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./tests/fixtures/proxy_v2/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    networks:
+      proxy_v2_fixture:
+        ipv4_address: 172.31.254.20
+
+  proxy_v2_probe:
+    <<: *fixture-service
+    depends_on:
+      - haproxy_proxy_v2
+    command:
+      - probe
+      - --host
+      - 172.31.254.20
+      - --port
+      - "8080"
+      - --payload-hex
+      - 70726f78792d76322d6170706c69636174696f6e2d6672616d650a
+      - --attempts
+      - "20"
+      - --retry-seconds
+      - "0.25"
+    networks:
+      proxy_v2_fixture:
+        ipv4_address: 172.31.254.30
+
+networks:
+  proxy_v2_fixture:
+    ipam:
+      config:
+        - subnet: 172.31.254.0/24

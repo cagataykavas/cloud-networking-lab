@@ -129,6 +129,34 @@ rejected instead of inheriting permissive JSON-parser behavior.
 - Hashes are evidence identifiers, not secrecy controls; low-entropy headers may be
   guessable and evidence still requires access control.
 
-The next integration step is a pinned proxy container that sends real preambles
-through this adapter, proves application bytes remain framed, and exports the
-evidence to an authenticated append-only log destination.
+## Pinned HAProxy loopback
+
+`docker-compose.proxy-v2.yml` closes the producer/consumer compatibility gap with
+a real HAProxy 3.2.26 process pinned to its multi-platform image digest. The
+hermetic topology uses fixed, isolated addresses so the backend policy can trust
+only the HAProxy container and can bind the claimed destination to the frontend.
+The probe sends an application frame through HAProxy; the backend admits the real
+binary preamble, reads the exact post-header frame, and returns a privacy-reduced,
+self-digested receipt. Both fixture containers are read-only, run without Linux
+capabilities, and set `no-new-privileges`.
+
+Run the same boundary as CI:
+
+```bash
+docker compose -f docker-compose.proxy-v2.yml up -d --build \
+  proxy_v2_backend haproxy_proxy_v2
+docker compose -f docker-compose.proxy-v2.yml run --build --rm --no-deps proxy_v2_probe \
+  | tee proxy-v2-loopback.json
+python -m tools.proxy_v2_loopback verify-receipt proxy-v2-loopback.json \
+  --payload-hex 70726f78792d76322d6170706c69636174696f6e2d6672616d650a
+docker compose -f docker-compose.proxy-v2.yml down --volumes
+```
+
+HAProxy's `send-proxy-v2` configuration in this fixture does not request a CRC
+TLV, so this compatibility policy explicitly sets `require_crc32c=False`. That is
+a reviewed producer-specific exception, not a new default: the library continues
+to require CRC-32C unless a caller opts out. The receipt's SHA-256 detects edits
+but does not authenticate the producer.
+
+The next integration step is to export these receipts over an authenticated
+channel to an append-only destination and test deletion/rollback detection.
