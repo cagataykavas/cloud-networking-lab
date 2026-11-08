@@ -32,7 +32,7 @@ services:
         ipv4_address: 172.31.254.10
 
   haproxy_proxy_v2:
-    image: haproxy:3.2.26-alpine3.24@sha256:b715bb31981ee0810e9105e5bbc58c37ded574fe92af75277bc7f4c8e2208143
+    image: haproxy:3.2.26-alpine3.24@sha256:96ec3c75a9264ba94e733eeacb44051ed6e7b79bb77a73c2c36f236b6423f1f0
     depends_on:
       - proxy_v2_backend
     read_only: true
