@@ -17,4 +17,36 @@ jobs:
       - run: ruff check app tools tests 01_cidr.py 02_tcp_echo.py
       - run: python -m pytest -q
       - run: docker compose config
+      - name: Validate pinned HAProxy fixture
+        run: docker compose -f docker-compose.proxy-v2.yml config
+      - name: Build PROXY v2 fixture images
+        run: >-
+          docker compose -f docker-compose.proxy-v2.yml build
+          proxy_v2_backend proxy_v2_probe
+      - name: Start HAProxy PROXY v2 loopback
+        run: >-
+          docker compose -f docker-compose.proxy-v2.yml up -d --no-build
+          proxy_v2_backend haproxy_proxy_v2
+      - name: Exercise real PROXY v2 framing
+        id: proxy_v2_loopback
+        run: |
+          set -o pipefail
+          docker compose -f docker-compose.proxy-v2.yml run --rm --no-deps proxy_v2_probe \
+            | tee "${RUNNER_TEMP}/proxy-v2-loopback.json"
+      - name: Verify PROXY v2 loopback receipt
+        run: >-
+          python -m tools.proxy_v2_loopback verify-receipt
+          "${RUNNER_TEMP}/proxy-v2-loopback.json"
+          --payload-hex 70726f78792d76322d6170706c69636174696f6e2d6672616d650a
+      - name: Archive PROXY v2 loopback evidence
+        if: ${{ always() && (steps.proxy_v2_loopback.outcome == 'success' || steps.proxy_v2_loopback.outcome == 'failure') }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: proxy-v2-loopback-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/proxy-v2-loopback.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Stop HAProxy PROXY v2 loopback
+        if: always()
+        run: docker compose -f docker-compose.proxy-v2.yml down --volumes
       - run: docker build -t cloud-networking-lab:test .
