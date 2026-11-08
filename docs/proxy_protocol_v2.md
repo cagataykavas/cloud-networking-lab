@@ -206,7 +206,8 @@ ledger demonstrates the integration path but is not independently HMAC-verifiabl
 after the job completes.
 
 This is application-level append discipline, not WORM storage. A host administrator
-can replace both the ledger and its local checkpoint, and HMAC authenticates but
-does not encrypt the transport. The next step is to send append requests over mTLS
-to independently administered immutable storage and anchor checkpoints outside the
-collector's failure domain.
+can replace both the ledger and its local checkpoint. The optional
+[`proxy_v2_mtls_transport`](proxy_v2_mtls_transport.md) boundary now encrypts append
+traffic and authenticates both peers with TLS 1.3, CA validation, hostname checks,
+and certificate pins. Independently administered immutable storage and checkpoint
+anchoring remain the next failure-domain boundary.
