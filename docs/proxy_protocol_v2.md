@@ -160,5 +160,53 @@ a reviewed producer-specific exception, not a new default: the library continues
 to require CRC-32C unless a caller opts out. The receipt's SHA-256 detects edits
 but does not authenticate the producer.
 
-The next integration step is to export these receipts over an authenticated
-channel to an append-only destination and test deletion/rollback detection.
+### Authenticated receipt ledger
+
+`tools.proxy_v2_receipt_ledger` separates receipt production from retention with
+an HMAC-authenticated append request. The request binds the complete verified
+receipt, a unique nonce, and the ledger head the producer observed. The collector
+holds an exclusive file lock, revalidates the complete chain, rejects stale heads
+and replayed nonces, then appends one canonical JSON line and calls `fsync`.
+
+Each entry commits to its predecessor. The collector also emits an authenticated
+checkpoint containing the entry count, head, and complete-ledger digest. A later
+verification with the retained checkpoint detects edited entries, deleted tails,
+and rollback to an older ledger. Callers that retain the latest head independently
+can additionally reject a replayed older ledger/checkpoint pair.
+
+The CLI requires distinct 32–64 byte request and checkpoint keys in regular
+mode-`0600` files. This separates producer authority from collector/checkpoint
+authority; neither key is written to a request, ledger, checkpoint, log, or artifact:
+
+```bash
+head=0000000000000000000000000000000000000000000000000000000000000000
+python -m tools.proxy_v2_receipt_ledger create-request \
+  proxy-v2-loopback.json append-request.json \
+  --request-key-file /run/secrets/proxy-ledger-request-hmac \
+  --expected-head "$head" --nonce "run-123-attempt-1" \
+  --payload-hex 70726f78792d76322d6170706c69636174696f6e2d6672616d650a
+python -m tools.proxy_v2_receipt_ledger append \
+  proxy-v2-loopback.json append-request.json receipts.jsonl checkpoint.json \
+  --request-key-file /run/secrets/proxy-ledger-request-hmac \
+  --checkpoint-key-file /run/secrets/proxy-ledger-checkpoint-hmac \
+  --payload-hex 70726f78792d76322d6170706c69636174696f6e2d6672616d650a
+python -m tools.proxy_v2_receipt_ledger verify receipts.jsonl checkpoint.json \
+  --request-key-file /run/secrets/proxy-ledger-request-hmac \
+  --checkpoint-key-file /run/secrets/proxy-ledger-checkpoint-hmac \
+  --minimum-entries 1
+```
+
+The implementation bounds the ledger to 4 MiB and 10,000 entries, rejects
+symlinked inputs, enforces private key/ledger permissions, and authenticates before
+creating a new ledger. CI exercises this protocol with separate ephemeral random
+keys and the real HAProxy receipt; deployments should obtain stable, role-scoped
+keys from a secret manager and retain checkpoints or heads in an independently
+controlled system. Because the CI keys are deliberately discarded, its archived
+ledger demonstrates the integration path but is not independently HMAC-verifiable
+after the job completes.
+
+This is application-level append discipline, not WORM storage. A host administrator
+can replace both the ledger and its local checkpoint, and HMAC authenticates but
+does not encrypt the transport. The next step is to send append requests over mTLS
+to independently administered immutable storage and anchor checkpoints outside the
+collector's failure domain.

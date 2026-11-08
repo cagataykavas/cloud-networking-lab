@@ -38,12 +38,49 @@ jobs:
           python -m tools.proxy_v2_loopback verify-receipt
           "${RUNNER_TEMP}/proxy-v2-loopback.json"
           --payload-hex 70726f78792d76322d6170706c69636174696f6e2d6672616d650a
+      - name: Authenticate and retain PROXY v2 receipt
+        env:
+          REQUEST_KEY: ${{ runner.temp }}/proxy-v2-ledger-request.key
+          CHECKPOINT_KEY: ${{ runner.temp }}/proxy-v2-ledger-checkpoint.key
+          LEDGER_REQUEST: ${{ runner.temp }}/proxy-v2-ledger-request.json
+          LEDGER_PATH: ${{ runner.temp }}/proxy-v2-ledger.jsonl
+          LEDGER_CHECKPOINT: ${{ runner.temp }}/proxy-v2-ledger-checkpoint.json
+        run: |
+          python - <<'PY'
+          import os
+          import secrets
+          from pathlib import Path
+
+          for variable in ("REQUEST_KEY", "CHECKPOINT_KEY"):
+              path = Path(os.environ[variable])
+              path.write_bytes(secrets.token_bytes(32))
+              path.chmod(0o600)
+          PY
+          python -m tools.proxy_v2_receipt_ledger create-request \
+            "${RUNNER_TEMP}/proxy-v2-loopback.json" "${LEDGER_REQUEST}" \
+            --request-key-file "${REQUEST_KEY}" \
+            --expected-head 0000000000000000000000000000000000000000000000000000000000000000 \
+            --nonce "run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}" \
+            --payload-hex 70726f78792d76322d6170706c69636174696f6e2d6672616d650a
+          python -m tools.proxy_v2_receipt_ledger append \
+            "${RUNNER_TEMP}/proxy-v2-loopback.json" "${LEDGER_REQUEST}" \
+            "${LEDGER_PATH}" "${LEDGER_CHECKPOINT}" \
+            --request-key-file "${REQUEST_KEY}" \
+            --checkpoint-key-file "${CHECKPOINT_KEY}" \
+            --payload-hex 70726f78792d76322d6170706c69636174696f6e2d6672616d650a
+          python -m tools.proxy_v2_receipt_ledger verify \
+            "${LEDGER_PATH}" "${LEDGER_CHECKPOINT}" \
+            --request-key-file "${REQUEST_KEY}" \
+            --checkpoint-key-file "${CHECKPOINT_KEY}" --minimum-entries 1
       - name: Archive PROXY v2 loopback evidence
         if: ${{ always() && (steps.proxy_v2_loopback.outcome == 'success' || steps.proxy_v2_loopback.outcome == 'failure') }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: proxy-v2-loopback-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/proxy-v2-loopback.json
+          path: |
+            ${{ runner.temp }}/proxy-v2-loopback.json
+            ${{ runner.temp }}/proxy-v2-ledger.jsonl
+            ${{ runner.temp }}/proxy-v2-ledger-checkpoint.json
           if-no-files-found: error
           retention-days: 14
       - name: Stop HAProxy PROXY v2 loopback
