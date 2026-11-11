@@ -23,7 +23,7 @@ The backend containers are intentionally attached only to the internal `private_
 docker compose up --build
 curl http://localhost:8080/whoami
 python tools/load_demo.py --requests 200 --concurrency 32
-python tools/network_probe.py http://localhost:8080/whoami
+python tools/network_probe.py --allow-private http://localhost:8080/whoami
 ```
 
 Repeated `/whoami` calls expose the selected backend so load balancing is observable. `load_demo.py` reports backend distribution, throughput and p50/p95/p99 latency.
@@ -49,7 +49,7 @@ This makes proxy retry/failover behavior visible. The Nginx config uses connecti
 | `02_tcp_echo.py` | TCP sockets, listening ports, connection establishment and byte streams |
 | `app/backend.py` | HTTP application behind a proxy; forwarded headers and instance identity |
 | `nginx.conf` | Layer-7 reverse proxy, least-connection balancing, keep-alive and timeout policy |
-| `tools/network_probe.py` | DNS resolution → TCP connect → HTTP request timing |
+| `tools/network_probe.py` | policy-checked DNS resolution → pinned TCP/HTTP request timing |
 | `tools/load_demo.py` | concurrency, throughput, latency percentiles and backend distribution |
 | `docker-compose.yml` | edge/private network segmentation and service discovery by DNS name |
 
@@ -67,6 +67,12 @@ Be able to explain these mappings, not merely memorize them:
 - **TLS termination** — decrypt at the edge or propagate TLS end-to-end depending on trust boundaries.
 - **Timeouts/retries** — a reliability policy that must be bounded to avoid retry storms.
 - **Private endpoint** — reach managed services without routing traffic through a public internet path.
+
+## Safe network probing
+
+The network probe resolves a hostname exactly once, filters non-global destinations by default, and connects the TCP and HTTP phases directly to an approved address. This keeps the reported DNS evidence bound to the destination actually contacted instead of allowing a second lookup to change the target. HTTP redirects are reported but never followed, URL credentials and fragments are rejected, and timeouts and response reads are bounded.
+
+Private, loopback, link-local, reserved, and other non-global destinations require the explicit `--allow-private` flag. Use that escape hatch only for trusted lab targets such as the local Compose stack; it is not a general SSRF authorization mechanism. HTTPS still validates the certificate and sends SNI for the original hostname while the socket remains pinned to the approved address.
 
 ## Useful commands while the stack is running
 
