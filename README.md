@@ -24,6 +24,7 @@ docker compose up --build
 curl http://localhost:8080/whoami
 python tools/load_demo.py --requests 200 --concurrency 32
 python tools/network_probe.py http://localhost:8080/whoami
+python tools/path_mtu_audit.py examples/path_mtu_policy.json
 ```
 
 Repeated `/whoami` calls expose the selected backend so load balancing is observable. `load_demo.py` reports backend distribution, throughput and p50/p95/p99 latency.
@@ -51,7 +52,31 @@ This makes proxy retry/failover behavior visible. The Nginx config uses connecti
 | `nginx.conf` | Layer-7 reverse proxy, least-connection balancing, keep-alive and timeout policy |
 | `tools/network_probe.py` | DNS resolution → TCP connect → HTTP request timing |
 | `tools/load_demo.py` | concurrency, throughput, latency percentiles and backend distribution |
+| `tools/path_mtu_audit.py` | pre-deployment MTU, encapsulation and PMTUD admission |
 | `docker-compose.yml` | edge/private network segmentation and service discovery by DNS name |
+
+## Path-MTU admission
+
+Overlay and VPN headers consume the underlay packet budget. A workload configured for
+1500-byte IP packets can therefore fail only for larger requests when an intermediate
+segment cannot carry the encapsulated packet and ICMP feedback is filtered.
+
+`path_mtu_audit.py` evaluates that risk from a reviewed deployment policy:
+
+```bash
+python tools/path_mtu_audit.py examples/path_mtu_policy.json
+```
+
+The JSON report identifies every segment's inner MTU budget, the path bottleneck and
+conservative TCP MSS values for IPv4 and IPv6. It exits `0` only when the workload MTU
+fits the entire path, the family-specific floor is preserved, and every segment allows
+ICMP Packet Too Big / Fragmentation Needed feedback. Policy errors exit `1`; an
+admission denial exits `2`, so the command can gate infrastructure CI.
+
+`encapsulation_overhead` must include all headers added on that segment (for example,
+outer IP, UDP and tunnel headers). The audit is deterministic and does not discover a
+live route; production rollout should still verify the actual path with platform-native
+telemetry or controlled probes.
 
 ## Interview map
 
