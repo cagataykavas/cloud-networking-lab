@@ -51,7 +51,27 @@ This makes proxy retry/failover behavior visible. The Nginx config uses connecti
 | `nginx.conf` | Layer-7 reverse proxy, least-connection balancing, keep-alive and timeout policy |
 | `tools/network_probe.py` | DNS resolution → TCP connect → HTTP request timing |
 | `tools/load_demo.py` | concurrency, throughput, latency percentiles and backend distribution |
+| `tools/route_admission.py` | prefix-origin authorization, AS-path and route-leak admission |
 | `docker-compose.yml` | edge/private network segmentation and service discovery by DNS name |
+
+## Route-origin admission
+
+`tools/route_admission.py` is a bounded, deterministic audit for proposed BGP-style route
+announcements. It checks each IPv4 or IPv6 prefix against reviewed prefix-origin authorizations
+using route-origin semantics: a covering authorization must name the same origin ASN and permit the
+announced prefix length. The audit also rejects an unexpected default route, an origin/path
+mismatch, a local-AS loop, an overlong AS path, duplicate evidence and non-canonical prefixes.
+
+The report contains per-route findings, aggregate finding counts and a stable SHA-256 commitment
+over the policy, authorizations and announcements. It allows consecutive origin-AS prepending
+rather than treating a common traffic-engineering practice as a loop. Inputs are bounded before
+evaluation so an untrusted route dump cannot grow memory without a reviewed limit.
+
+This is an offline admission primitive, not a BGP speaker or a replacement for live RPKI origin
+validation. It trusts the supplied authorization snapshot and does not validate signatures,
+freshness, ASPA relationships, peering policy, next-hop reachability or data-plane forwarding.
+The matching model follows [RFC 6811](https://www.rfc-editor.org/rfc/rfc6811.html); local-AS loop
+detection follows the AS-path rule in [RFC 4271](https://www.rfc-editor.org/rfc/rfc4271.html).
 
 ## Interview map
 
