@@ -1,0 +1,18 @@
+{
+  "ip_family": "dual_stack",
+  "required_ip_mtu": 1400,
+  "segments": [
+    {
+      "name": "vpc-underlay",
+      "link_mtu": 1500,
+      "encapsulation_overhead": 0,
+      "pmtud_signals_allowed": true
+    },
+    {
+      "name": "wireguard-tunnel",
+      "link_mtu": 1500,
+      "encapsulation_overhead": 80,
+      "pmtud_signals_allowed": true
+    }
+  ]
+}
