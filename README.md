@@ -28,6 +28,20 @@ python tools/network_probe.py http://localhost:8080/whoami
 
 Repeated `/whoami` calls expose the selected backend so load balancing is observable. `load_demo.py` reports backend distribution, throughput and p50/p95/p99 latency.
 
+## Forwarded-client trust boundary
+
+The private-side proxy has a fixed `172.29.0.10` address, and each backend trusts
+forwarding metadata only from that exact `/32`. `/whoami` reports both the socket
+peer and the resolved client identity. The resolver walks `X-Forwarded-For` from
+right to left, removes only configured proxy hops, and ignores the header entirely
+when the immediate peer is not trusted. This prevents a public client from choosing
+its identity by prepending a forged address to the header.
+
+`TRUSTED_PROXY_CIDRS` accepts an explicit comma-separated CIDR allowlist. Invalid
+CIDRs fail during application startup; malformed, oversized, or excessively long
+forwarding chains fail closed to the socket peer. Keep the allowlist as narrow as
+the deployed proxy addresses rather than trusting an entire application subnet.
+
 ## Failure experiments
 
 While the stack is running:
@@ -47,7 +61,8 @@ This makes proxy retry/failover behavior visible. The Nginx config uses connecti
 |---|---|
 | `01_cidr.py` | IPv4 networks, CIDR membership and subnet splitting |
 | `02_tcp_echo.py` | TCP sockets, listening ports, connection establishment and byte streams |
-| `app/backend.py` | HTTP application behind a proxy; forwarded headers and instance identity |
+| `app/backend.py` | HTTP application behind a proxy; trusted forwarded-client identity and instance identity |
+| `app/client_identity.py` | bounded, spoof-resistant proxy-chain evaluation |
 | `nginx.conf` | Layer-7 reverse proxy, least-connection balancing, keep-alive and timeout policy |
 | `tools/network_probe.py` | DNS resolution → TCP connect → HTTP request timing |
 | `tools/load_demo.py` | concurrency, throughput, latency percentiles and backend distribution |

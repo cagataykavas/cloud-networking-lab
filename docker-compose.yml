@@ -11,13 +11,15 @@ services:
       backend_b:
         condition: service_healthy
     networks:
-      - edge
-      - private_app
+      edge: {}
+      private_app:
+        ipv4_address: 172.29.0.10
 
   backend_a:
     build: .
     environment:
       INSTANCE_ID: backend-a
+      TRUSTED_PROXY_CIDRS: 172.29.0.10/32
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=1)"]
       interval: 3s
@@ -31,6 +33,7 @@ services:
     build: .
     environment:
       INSTANCE_ID: backend-b
+      TRUSTED_PROXY_CIDRS: 172.29.0.10/32
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=1)"]
       interval: 3s
